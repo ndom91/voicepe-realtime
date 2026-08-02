@@ -186,7 +186,7 @@ schema:
   websocket_port: int(1024,65535)
   session_reuse_timeout_seconds: int(0,3600)
   max_context_messages: int(0,100)
-  transcription_model: "list(gpt-4o-transcribe|gpt-realtime-whisper|gpt-4o-mini-transcribe|whisper-1|custom)"
+  transcription_model: "list(gpt-live-transcribe|gpt-transcribe|gpt-4o-transcribe|gpt-realtime-whisper|gpt-4o-mini-transcribe|whisper-1|custom)"
   transcription_model_custom: str?
   # Legacy server_vad escape hatch — optional, hidden until "Show unused
   # optional configuration options" is toggled (or a value is saved).
