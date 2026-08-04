@@ -68,6 +68,14 @@ class RawAudioSerializer(FrameSerializer):
         # device (cancels its no-speech watchdog — audio is flowing).
         self._ack_pending = False
         self._on_first_audio = None
+        # Async callback for {"type":"ping"}. The device pings to keep the link
+        # alive and expects a pong; the reply used to be registered on an event
+        # pipecat never fires, so no pong was ever sent.
+        self._on_ping = None
+        # Called on any sign this device is the one being used (wake, button).
+        # Decides which device announcements and timers address when no
+        # explicit target is given.
+        self._on_activity = None
 
     def set_interrupt_handler(self, handler):
         """Register the async no-arg callback fired on a device 'interrupt'."""
@@ -107,6 +115,14 @@ class RawAudioSerializer(FrameSerializer):
         """Register the async no-arg callback fired when the DEVICE ends
         enrollment ({"type":"enroll_stopped"} — button escape or firmware cap)."""
         self._on_enroll_stopped = handler
+
+    def set_ping_handler(self, handler):
+        """Async no-arg callback answering the device's keepalive ping."""
+        self._on_ping = handler
+
+    def set_activity_handler(self, handler):
+        """Sync no-arg callback marking this device as the one in use."""
+        self._on_activity = handler
 
     @property
     def type(self) -> FrameSerializerType:
@@ -196,6 +212,17 @@ class RawAudioSerializer(FrameSerializer):
                         await self._on_button_cancel()
                     except Exception as e:
                         logger.warning(f"⚠️ false-flag handler failed: {e!r}")
+            elif isinstance(data, dict) and data.get("type") == "ping":
+                # Keepalive. This lived in a transport "on_client_message"
+                # handler that pipecat never registers, so add_event_handler
+                # only logged "not registered" and the device never got a pong.
+                # Control frames reach the app through this serializer, so the
+                # reply belongs here.
+                if self._on_ping is not None:
+                    try:
+                        await self._on_ping()
+                    except Exception as e:
+                        logger.warning(f"⚠️ ping handler failed: {e!r}")
             elif isinstance(data, dict) and data.get("type") == "enroll_stopped":
                 # Device-side enrollment exit (button / firmware safety cap).
                 logger.info("🎓 device ended enrollment")
@@ -213,6 +240,11 @@ class RawAudioSerializer(FrameSerializer):
                 self._last_wake_mono = time.monotonic()
                 self._reply_audio_since_wake = False
                 self._ack_pending = True
+                # A wake is the strongest signal that THIS device is the one in
+                # use, so it becomes the default target for announcements and
+                # timer rings.
+                if self._on_activity is not None:
+                    self._on_activity()
                 try:
                     from .ha_sensors import PUBLISHER
                     await PUBLISHER.wake()

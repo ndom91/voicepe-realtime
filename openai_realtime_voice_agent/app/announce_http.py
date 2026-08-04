@@ -53,13 +53,17 @@ async def start_announce_server(port: int, token: str, announcer, is_connected) 
                 return web.json_response({"status": "duplicate_suppressed",
                                           "note": "already announced — do not retry or re-announce"})
         _recent.append((now, norm))
-        logger.info(f"📢 announce: {message[:80]}")
+        # Optional room selection. With several devices connected, "the
+        # device" is ambiguous: an explicit device_id names the room, and
+        # omitting it speaks on whichever device was last used.
+        device_id = (body.get("device_id") or "").strip() or None
+        logger.info(f"📢 announce{f' [{device_id}]' if device_id else ''}: {message[:80]}")
         try:
-            await announcer(message)
+            await announcer(message, device_id)
         except Exception as e:
             logger.warning(f"⚠️ announce failed: {e!r}")
             return web.json_response({"error": "announcement failed"}, status=500)
-        return web.json_response({"status": "announced"})
+        return web.json_response({"status": "announced", "device_id": device_id})
 
     app = web.Application()
     app.router.add_post("/announce", handle)

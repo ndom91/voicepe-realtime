@@ -296,11 +296,11 @@ class EnrollmentConductor:
     CHUNK = 4800          # 100 ms of 24 kHz mono PCM16
     REP_GAP_S = 4.5
 
-    def __init__(self, recorder, broadcast_json, broadcast_bytes, api_key,
+    def __init__(self, recorder, send_json, send_bytes, api_key,
                  phrase="hey leonard", tts_voice="fable"):
         self.recorder = recorder
-        self.broadcast_json = broadcast_json
-        self.broadcast_bytes = broadcast_bytes
+        self.send_json = send_json
+        self.send_bytes = send_bytes
         self.api_key = api_key
         self.phrase = phrase or "your wake word"
         self.tts_voice = tts_voice or "fable"
@@ -334,10 +334,10 @@ class EnrollmentConductor:
             f.write(pcm)
         return pcm
 
-    async def _say(self, text):
+    async def _say(self, text, device_id=None):
         pcm = await self._tts(text)
         for i in range(0, len(pcm), self.CHUNK):
-            await self.broadcast_bytes(pcm[i:i + self.CHUNK])
+            await self.send_bytes(pcm[i:i + self.CHUNK], device_id)
             await asyncio.sleep(0.095)
 
     def start(self, person):
@@ -358,7 +358,7 @@ class EnrollmentConductor:
     async def _finish(self):
         info = self.recorder.stop() if self.recorder.active else {}
         try:
-            await self.broadcast_json({"type": "enroll", "mode": "stop"})
+            await self.send_json({"type": "enroll", "mode": "stop"})
         except Exception:
             pass
         if self.on_finished is not None and info.get("path"):
@@ -372,7 +372,7 @@ class EnrollmentConductor:
         p = self.phrase
         try:
             self.recorder.start(person)
-            await self.broadcast_json({"type": "enroll", "mode": "start"})
+            await self.send_json({"type": "enroll", "mode": "start"})
             await asyncio.sleep(0.8)
             await self._say(
                 f"Voice training. Each time I say 'next', say '{p}' once, "

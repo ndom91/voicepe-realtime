@@ -9,7 +9,6 @@ from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineTask
 from pipecat.services.openai.realtime.llm import OpenAIRealtimeLLMService
-from pipecat.transports.websocket.server import WebsocketServerTransport
 from app.mcp_service import HomeAssistantMCPService
 from app.phase_emitter import TURN_LIVENESS
 from app.disconnect_tool import get_disconnect_tool_definition, create_disconnect_tool_handler
@@ -300,15 +299,14 @@ class Application:
     
     def __init__(self):
         """Initialize application."""
-        self.pipeline: Optional[Pipeline] = None
-        self.runner: Optional[PipelineRunner] = None
+        # NB: there is deliberately no application-wide pipeline, transport or
+        # OpenAI service any more. Each connected device owns its own — see
+        # WebSocketHandler.serve_connection — because sharing one of each is
+        # what made a second device evict the first.
         self.websocket_handler: Optional[WebSocketHandler] = None
-        self.websocket_transport: Optional[WebsocketServerTransport] = None
-        self.openai_service: Optional[OpenAIRealtimeLLMService] = None
         self.mcp_service: Optional[HomeAssistantMCPService] = None
         self.audio_recording_service: Optional[AudioRecordingService] = None
         self.session_manager: Optional[SessionManager] = None
-        self.current_task: Optional[PipelineTask] = None
         self._pipeline_lock: Optional[asyncio.Lock] = None
         
     async def initialize(self) -> None:
@@ -349,7 +347,7 @@ class Application:
         # service only auto-creates a response for the FIRST context (turn 1) and
         # after tool results; plain 2nd/3rd user turns get NO response unless the
         # server makes it. FALSE reproduces the old single-turn-only behaviour
-        # (turn 1 answers, turn 2 hangs in "thinking"). See _ensure_openai_service.
+        # (turn 1 answers, turn 2 hangs in "thinking"). See create_openai_service.
         semantic_vad_create_response = os.environ.get("SEMANTIC_VAD_CREATE_RESPONSE", "true").strip().lower() == "true"
         # Expose the `disconnect_client` tool to the model. DEFAULT FALSE: on the
         # Voice PE the device owns its own session lifecycle (wake word starts a
@@ -547,8 +545,8 @@ class Application:
         self.websocket_handler.enrollment_recorder = self.enrollment_recorder
         self.enrollment_conductor = EnrollmentConductor(
             self.enrollment_recorder,
-            self.websocket_handler.broadcast_json,
-            self.websocket_handler.broadcast_bytes,
+            self.websocket_handler.send_json_to,
+            self.websocket_handler.send_bytes_to,
             openai_api_key,
             phrase=os.environ.get("ENROLLMENT_PHRASE", "").strip(),
             tts_voice=os.environ.get("ENROLLMENT_TTS_VOICE", "fable").strip() or "fable",
@@ -595,15 +593,17 @@ class Application:
         self.enrollment_conductor.on_finished = _auto_build_voiceprint
         # Timers: personalized spoken expiry via the conductor's TTS lane,
         # owner from the live speaker verdict, wake-ack from the serializer.
-        async def _guarded_say(text):
-            # Suppress inbound mic audio while the announcement plays (+ tail)
-            # so the assistant can't hear itself and reply.
-            ser = self.websocket_handler._serializer
+        async def _guarded_say(text, device_id=None):
+            # Speak on ONE device. With several connected, "the device" is
+            # whichever was named, else the one most recently spoken to.
+            # Suppress that device's inbound mic while the announcement plays
+            # (+ tail) so the assistant can't hear itself and reply.
+            ser = self.websocket_handler.serializer_for(device_id)
             import time as _t
             if ser is not None:
                 ser.suppress_inbound_until = _t.monotonic() + 3600
             try:
-                await self.enrollment_conductor._say(text)
+                await self.enrollment_conductor._say(text, device_id=device_id)
             finally:
                 if ser is not None:
                     ser.suppress_inbound_until = _t.monotonic() + 1.2
@@ -611,12 +611,22 @@ class Application:
         self.timer_registry.get_owner = (
             lambda: SPEAKER_PROBE.name_for(SPEAKER_PROBE.gate_speaker()) if SPEAKER_PROBE else None
         )
-        self.timer_registry.last_wake = (
-            lambda: max(
-                getattr(self.websocket_handler._serializer, "_last_wake_mono", 0.0),
-                getattr(self.websocket_handler._serializer, "_last_button_mono", 0.0),
-            ) if self.websocket_handler._serializer else 0.0
-        )
+        def _last_wake_any_device() -> float:
+            # The most recent wake/button across ALL devices: a timer must not
+            # ring over someone mid-turn in another room either.
+            latest = 0.0
+            for connection in self.websocket_handler.devices:
+                ser = connection.serializer
+                if ser is None:
+                    continue
+                latest = max(
+                    latest,
+                    getattr(ser, "_last_wake_mono", 0.0),
+                    getattr(ser, "_last_button_mono", 0.0),
+                )
+            return latest
+
+        self.timer_registry.last_wake = _last_wake_any_device
 
         # Announce endpoint (fork): a LAN route back to the device so the
         # household's agent can speak results of long-running work. Reuses the
@@ -626,12 +636,15 @@ class Application:
         if announce_port and announce_token:
             await start_announce_server(
                 announce_port, announce_token, _guarded_say,
-                lambda: self.websocket_handler._serializer is not None,
+                # "Is a device reachable?" — true while any device is
+                # connected. The endpoint accepts an optional device_id to
+                # choose the room; without one it speaks on the last-active.
+                lambda: len(self.websocket_handler.devices) > 0,
             )
         elif announce_port or announce_token:
             logger.warning("⚠️ announce endpoint needs BOTH announce_port and announce_token — disabled")
 
-        self.websocket_transport = self.websocket_handler.create_transport()
+        # Transports are created per connection now, not once at startup.
         
         # Store configuration for session creation
         self.openai_api_key = openai_api_key
@@ -666,51 +679,42 @@ class Application:
         
         logger.info("✅ Application initialized - ready to accept WebSocket connections")
     
-    def _build_pipeline_for_transport(self, transport: WebsocketServerTransport, client_id: str):
-        """
-        Build pipeline for a WebSocket transport connection.
-        
-        Args:
-            transport: The WebSocket transport instance
-            client_id: Unique identifier for the client device
-        """
-        # Ensure OpenAI service exists
-        if self.openai_service is None:
-            raise RuntimeError("OpenAI service must be created before building pipeline")
-        
-        # Use WebSocket handler to build pipeline
-        self.pipeline, self.runner, self.current_task = self.websocket_handler.build_pipeline(
-            transport=transport,
-            openai_service=self.openai_service,
-            client_id=client_id,
-            activity_callback=self._update_session_activity
-        )
-    
     def _update_session_activity(self):
         """Update session activity timestamp (called by SessionActivityTracker)."""
         pass
     
-    async def _ensure_openai_service(self, client_id: Optional[str] = None):
-        """Create a new OpenAI service instance for a client.
-        
+    async def create_openai_service(self, connection):
+        """Create an OpenAI Realtime session for ONE device.
+
+        This used to assign the single `self.openai_service`, so a second
+        device connecting replaced the first device's live session and wiped
+        its conversation. It now returns a fresh service that belongs to the
+        calling connection and to nothing else.
+
         Args:
-            client_id: Optional client ID for session management
+            connection: The DeviceConnection the session will serve. Its
+                transport is needed so device-scoped tools act on that device.
+
+        Returns:
+            A newly created SafeRealtimeLLMService.
         """
+        client_id = connection.device_id
         if self._pipeline_lock is None:
             self._pipeline_lock = asyncio.Lock()
-        
+
         async with self._pipeline_lock:
             if client_id is None:
-                logger.warning("⚠️ No client_id provided to _ensure_openai_service")
-            
+                logger.warning("⚠️ No client_id provided to create_openai_service")
+
             # Create new session
             if client_id:
                 logger.info(f"🆕 Creating new OpenAI Session for Client {client_id}...")
             else:
                 logger.info("🆕 Creating new OpenAI Session...")
-            
-            # Cache context from old service before creating new one
-            if client_id and self.openai_service is not None:
+
+            # Cache context from this DEVICE's previous session (if it is
+            # reconnecting) so the conversation survives the reconnect.
+            if client_id and self.session_manager.get_current_service(client_id) is not None:
                 try:
                     self.session_manager.cleanup_before_new_session(client_id)
                     logger.debug(f"Cached context from previous session for client {client_id}")
@@ -880,23 +884,23 @@ class Application:
             logger.info(f"🔧 Creating session with {len(all_tools)} tools: {[tool.get('name', 'unknown') for tool in all_tools]}")
             
             # Create new service instance
-            self.openai_service = SafeRealtimeLLMService(
+            service = SafeRealtimeLLMService(
                 api_key=self.openai_api_key,
                 model=self.model,
                 session_properties=session_properties,
                 start_audio_paused=False
             )
-            logger.info(f"✅ OpenAI Service created: {type(self.openai_service).__name__}")
+            logger.info(f"✅ OpenAI Service created: {type(service).__name__}")
             
             # Register disconnect tool handler (only when the tool is exposed)
             if self.enable_disconnect_tool:
-                disconnect_tool_handler = create_disconnect_tool_handler(self.websocket_transport)
-                self.openai_service.register_function("disconnect_client", disconnect_tool_handler)
+                disconnect_tool_handler = create_disconnect_tool_handler(connection.transport)
+                service.register_function("disconnect_client", disconnect_tool_handler)
                 logger.info("✅ Registered disconnect tool handler")
 
             # Register web search tool handler (only when the tool is exposed)
             if self.enable_web_search:
-                self.openai_service.register_function(
+                service.register_function(
                     "web_search",
                     create_web_search_tool_handler(self.openai_api_key, self.web_search_model),
                 )
@@ -909,25 +913,25 @@ class Application:
                     return None
                 return SPEAKER_PROBE.name_for(SPEAKER_PROBE.gate_speaker())
 
-            self.openai_service.register_function(
+            service.register_function(
                 "voice_enrollment",
                 create_enrollment_tool_handler(self.enrollment_conductor, _current_speaker_name),
             )
             logger.info("✅ Registered voice_enrollment tool handler")
-            self.openai_service.register_function(
+            service.register_function(
                 "mark_false_wake", create_false_alarm_tool_handler()
             )
-            register_timer_tools(self.openai_service, self.timer_registry)
-            register_memory_tools(self.openai_service, _current_speaker_name)
+            register_timer_tools(service, self.timer_registry)
+            register_memory_tools(service, _current_speaker_name)
             if openclaw_url():
-                register_openclaw_tool(self.openai_service)
+                register_openclaw_tool(service)
                 logger.info("✅ Registered DIRECT ask_openclaw tool (bypassing HA MCP 60s cap)")
             logger.info("✅ Registered timer + memory tools")
 
             # Register MCP tool handlers if available
             if self.mcp_client and mcp_tools_schema:
                 try:
-                    await self.mcp_client.register_tools_schema(mcp_tools_schema, self.openai_service)
+                    await self.mcp_client.register_tools_schema(mcp_tools_schema, service)
                     logger.info(f"✅ Registered {len(mcp_tools_schema.standard_tools)} MCP tool handlers")
                 except Exception as e:
                     logger.warning(f"⚠️ Failed to register MCP tool handlers: {e}")
@@ -938,141 +942,157 @@ class Application:
             # path and its 60s cap. Observed live 2026-07-13: "It failed. I
             # couldn't send the text" at exactly 60s — while the text sent fine.
             if openclaw_url():
-                register_openclaw_tool(self.openai_service)
+                register_openclaw_tool(service)
                 logger.info("✅ DIRECT ask_openclaw re-registered after MCP handlers (wins)")
             
             # Register service with session manager
             if client_id:
-                self.session_manager.set_current_service(client_id, self.openai_service)
-            
+                self.session_manager.set_current_service(client_id, service)
+
+            self._preseed_context(service)
+
             logger.info("✅ New OpenAI Session created")
-            return self.openai_service
+            return service
+
+    def _preseed_context(self, service) -> None:
+        """Stop pipecat speaking spontaneously on a brand-new session.
+
+        pipecat 0.0.97's `_handle_context` does `if not self._context: ...
+        await self._create_response()` — the very first context it sees
+        triggers a real, audible reply. With semantic_vad the SERVER also
+        creates a response per user turn, so the first real turn would
+        double-create → `conversation_already_has_active_response`.
+
+        Pre-setting an empty context sends the first real turn down the else
+        branch instead, so there is no double and no startup speech. This runs
+        per SESSION rather than once at startup: with a session per device,
+        every new connection has its own service that would otherwise greet
+        the room unprompted on connect.
+
+        Args:
+            service: The freshly created service.
+        """
+        if not (self.turn_detection_type == "semantic_vad" and self.semantic_vad_create_response):
+            return
+        try:
+            from pipecat.processors.aggregators.llm_context import LLMContext
+            if getattr(service, "_context", None) is not None:
+                return
+            service._context = LLMContext()
+            # pipecat re-sends the context's messages as ConversationItemCreate
+            # events on the first _create_response. On a fresh realtime session
+            # OpenAI already builds the conversation from the live audio + tool
+            # flow, so that re-injects items it has — which made the first
+            # post-tool reply come out as meaningless filler. Instructions are
+            # sent separately via _update_settings() on session.created, so
+            # clearing this is safe.
+            if hasattr(service, "_llm_needs_conversation_setup"):
+                service._llm_needs_conversation_setup = False
+            logger.info("🌱 Pre-seeded empty context (no spontaneous greeting on connect)")
+        except Exception as e:
+            logger.warning(f"⚠️ Could not pre-seed context (turn-1 double may occur): {e}")
     
-    async def run(self) -> None:
-        """Run the application."""
-        await self.initialize()
-        
-        # Create initial OpenAI service (will be replaced per connection)
-        await self._ensure_openai_service()
-        
-        # Build pipeline - based on pipecat-examples, one pipeline handles all connections
-        # The transport manages multiple connections internally
-        self._build_pipeline_for_transport(self.websocket_transport, "server")
+    def build_web_app(self):
+        """Build the FastAPI app that accepts device connections.
 
-        # Consume pipecat's FIRST-context auto-response ONCE at startup — SILENTLY.
-        # WHY: pipecat 0.0.97's OpenAIRealtimeLLMService._handle_context does
-        # `if not self._context: ... await self._create_response()` — i.e. the
-        # very first context it ever sees triggers a real response. With
-        # semantic_vad create_response=True the SERVER also creates a response on
-        # every user turn, so the user's first turn would double-create →
-        # `conversation_already_has_active_response` (cut turn 1 short, hung
-        # turn 2). We previously consumed that path with a throwaway LLMRunFrame
-        # kickoff — but an LLMRunFrame runs `_create_response()`, producing a REAL
-        # (audible, tool-calling) reply. The old comment assumed it "goes to no
-        # device" because nothing is connected at startup; WRONG: when the user
-        # updates the add-on the device auto-reconnects within seconds and lands
-        # mid-kickoff (and its post-tool follow-up), so the device plays a
-        # spontaneous "answer" nobody asked for (observed: "Ik vond geen
-        # betrouwbare lamp in de gang" right after a restart).
-        #
-        # Fix: pre-set `self._context` to an empty LLMContext instead. Now the
-        # first REAL user turn hits the ELSE branch of _handle_context (no
-        # _create_response), the server creates that turn's response (semantic_vad
-        # create_response=True), and there's no double — AND no startup speech.
-        # The empty sentinel is harmlessly overwritten by the real context on the
-        # first turn (both branches do `self._context = context`).
-        if self.turn_detection_type == "semantic_vad" and self.semantic_vad_create_response:
-            try:
-                from pipecat.processors.aggregators.llm_context import LLMContext
-                if self.openai_service is not None and getattr(self.openai_service, "_context", None) is None:
-                    self.openai_service._context = LLMContext()
-                    # Also mark pipecat's one-time "conversation setup" as already
-                    # done. pipecat runs it on the FIRST _create_response: it
-                    # re-sends the context's messages as ConversationItemCreate
-                    # events, then flips _llm_needs_conversation_setup False. On a
-                    # fresh realtime session OpenAI already builds the conversation
-                    # from the live audio + tool-call flow, so that one-time setup
-                    # re-injects items OpenAI already has — which made the first
-                    # post-tool reply come out as a meaningless filler ("Ik ben
-                    # klaar om verder te gaan met het gesprek."). Instructions are
-                    # sent independently via _update_settings() on session.created,
-                    # so clearing this flag is safe and makes the first real turn a
-                    # normal reply.
-                    if hasattr(self.openai_service, "_llm_needs_conversation_setup"):
-                        self.openai_service._llm_needs_conversation_setup = False
-                    logger.info("🌱 Pre-seeded empty context + marked conversation setup done (no startup speech, no first-turn filler)")
-                else:
-                    logger.info("🌱 Startup context already set; skipping pre-seed")
-            except Exception as e:
-                logger.warning(f"⚠️ Could not pre-seed startup context (turn-1 double may occur): {e}")
+        The listening socket used to belong to a single pipecat
+        WebsocketServerTransport, which closes the incumbent connection every
+        time a new one arrives. Owning the socket here means each accepted
+        connection can get its own transport, session and pipeline, so devices
+        no longer evict one another.
 
-        # Setup WebSocket event handlers
-        async def on_client_connected(client_id: str):
-            """Handle new client connection."""
-            await self._ensure_openai_service(client_id=client_id)
+        Returns:
+            The configured FastAPI application.
+        """
+        from fastapi import FastAPI, WebSocket
+
+        web_app = FastAPI(title="Voice PE Realtime backend")
+
+        async def _on_client_connected(device_id: str):
             if self.audio_recording_service:
-                self.audio_recording_service.start_new_session(client_id)
-        
-        def on_client_disconnected(client_id: str):
-            """Handle client disconnection."""
+                self.audio_recording_service.start_new_session(device_id)
+
+        def _on_client_disconnected(device_id: str):
             if self.session_manager:
-                self.session_manager.handle_client_disconnect(client_id, self.openai_service)
+                # Cache THIS device's context off THIS device's service, so a
+                # reconnect resumes its own conversation rather than whichever
+                # session happened to be current.
+                service = self.session_manager.get_current_service(device_id)
+                self.session_manager.handle_client_disconnect(device_id, service)
             if self.audio_recording_service:
                 self.audio_recording_service.stop_recording()
-        
-        # Function to get OpenAI service for a client
-        def get_openai_service_for_client(client_id: str) -> Optional[OpenAIRealtimeLLMService]:
-            """Get OpenAI service for a specific client."""
-            if self.session_manager:
-                return self.session_manager.get_current_service(client_id)
-            return self.openai_service
-        
-        self.websocket_handler.setup_event_handlers(
-            transport=self.websocket_transport,
-            on_client_connected_callback=on_client_connected,
-            on_client_disconnected_callback=on_client_disconnected,
-            openai_service_getter=get_openai_service_for_client
+
+        @web_app.websocket("/")
+        async def device_endpoint(websocket: WebSocket):
+            await self.websocket_handler.serve_connection(
+                websocket,
+                on_client_connected=_on_client_connected,
+                on_client_disconnected=_on_client_disconnected,
+                activity_callback=self._update_session_activity,
+            )
+
+        @web_app.get("/healthz")
+        async def healthz():
+            """Liveness plus the currently connected device ids."""
+            return {"status": "ok", "devices": self.websocket_handler.devices.ids()}
+
+        return web_app
+
+    async def run(self) -> None:
+        """Run the application."""
+        import uvicorn
+
+        await self.initialize()
+
+        # No pipeline is built here any more. There is no process-wide session
+        # to build one around: each device brings its own when it connects.
+        self.websocket_handler.openai_service_factory = self.create_openai_service
+
+        config = uvicorn.Config(
+            self.build_web_app(),
+            host=self.websocket_handler.host,
+            port=self.websocket_handler.port,
+            log_level="warning",
+            # The add-on installs its own signal handling; uvicorn's would
+            # fight with it and with the per-connection pipeline runners.
+            lifespan="off",
         )
-        
+        server = uvicorn.Server(config)
+        server.install_signal_handlers = lambda: None
+
+        logger.info(
+            f"✅ Listening for devices on ws://{self.websocket_handler.host}:"
+            f"{self.websocket_handler.port}/ (multi-device)"
+        )
         try:
-            # Start the pipeline runner - this will start the WebSocket server
-            # Based on pipecat-examples: PipelineRunner.run() starts the transport server
-            logger.info("✅ Starting WebSocket server and pipeline...")
-            await self.runner.run(self.current_task)
-        except KeyboardInterrupt:
-            logger.info("Received keyboard interrupt")
+            await server.serve()
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             logger.error(f"Fatal error: {e}", exc_info=True)
-            raise
         finally:
             await self.cleanup()
-    
+
     async def cleanup(self) -> None:
         """Cleanup resources."""
         logger.info("Cleaning up application...")
-        
-        if self.runner:
-            try:
-                await self.runner.cancel()
-            except Exception as e:
-                logger.warning(f"⚠️ Error cancelling runner: {e}")
-        
+
         if self.websocket_handler:
             try:
                 await self.websocket_handler.cleanup()
             except Exception as e:
                 logger.warning(f"⚠️ Error cleaning up WebSocket handler: {e}")
-        
+
         if self.audio_recording_service:
             self.audio_recording_service.cleanup()
-        
+
         logger.info("✅ Application cleanup complete")
 
 
 async def main() -> None:
     """Main entry point."""
     app = Application()
-    
+
     try:
         await app.run()
     except KeyboardInterrupt:
