@@ -1,23 +1,7 @@
-"""Per-device connection state and lookup.
+"""Per-device connection state and default-target lookup.
 
-The add-on used to hold exactly one of everything — one transport, one
-serializer, one OpenAI session, one pipeline — so a second device could only
-ever arrive by displacing the first. This module holds the state that has to
-become per-connection instead, and answers the question every single-device
-feature now has to ask: *which* device?
-
-Targeting policy
-----------------
-`resolve()` takes an optional device id:
-
-* an explicit id wins, and returns None if that device is not connected
-  (callers should surface that rather than quietly speaking in the wrong room)
-* no id falls back to the most recently active device, which is what a user
-  means by "the" device when only one is in play
-
-"Active" is refreshed on wake and on any spoken turn, not merely on connect,
-so an idle device that happens to have reconnected most recently does not
-steal announcements from the one actually in use.
+Explicit targets never fall back. Without a target, the most recently active
+connection is selected.
 """
 
 import asyncio
@@ -52,7 +36,7 @@ def sanitize_device_id(raw: str) -> str:
 
 
 def device_id_from_websocket(websocket: Any) -> str:
-    """Derive a stable device id for a connection.
+    """Derive a best-effort device identifier for a connection.
 
     Prefers an explicit `?device_id=` from the connection URL, because the
     fallback — the client IP — is not stable: it changes on DHCP renewal
@@ -102,6 +86,8 @@ class DeviceConnection:
     pipeline: Any = None
     task: Any = None
     runner: Any = None
+    speaker_probe: Any = None
+    turn_liveness: Any = None
     connected_at: float = field(default_factory=time.monotonic)
     last_active: float = field(default_factory=time.monotonic)
 
@@ -112,13 +98,8 @@ class DeviceConnection:
     async def send_json(self, obj: dict) -> bool:
         """Send one JSON control frame to this device.
 
-        Routed through the transport's client so it shares the send lock with
-        the audio path; falls back to the raw socket during connection setup,
-        before a transport exists and while nothing else can be writing.
-
-        NOTE: compact separators are required. The Voice PE firmware matches
-        phase messages with a literal substring test on `"value":"<phase>"`,
-        which the default `json.dumps` spacing would break.
+        Uses the transport client when available so control frames share its
+        send lock. Firmware phase parsing requires compact JSON.
 
         Args:
             obj: The object to serialize.

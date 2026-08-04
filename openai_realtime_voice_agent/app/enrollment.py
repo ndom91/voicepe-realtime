@@ -65,12 +65,13 @@ class EnrollmentRecorder:
         self.person: Optional[str] = None
         self.path: Optional[str] = None
         self._started_at: float = 0.0
+        self.device_id: Optional[str] = None
 
     @property
     def active(self) -> bool:
         return self._wav is not None
 
-    def start(self, person: str) -> str:
+    def start(self, person: str, device_id: str) -> str:
         if self._wav is not None:
             self.stop()
         safe = re.sub(r"[^a-z0-9_]+", "", person.lower().replace(" ", "_")) or "unknown"
@@ -84,6 +85,7 @@ class EnrollmentRecorder:
         self.person = safe
         self.path = path
         self._started_at = time.monotonic()
+        self.device_id = device_id
         logger.info(f"🎓 voice enrollment started for '{safe}' → {path}")
         try:
             import asyncio as _a
@@ -123,6 +125,7 @@ class EnrollmentRecorder:
             )
         self.person = None
         self.path = None
+        self.device_id = None
         try:
             import asyncio as _a
             from .ha_sensors import PUBLISHER
@@ -218,6 +221,7 @@ def get_enrollment_tool_definition() -> Dict[str, Any]:
 
 def create_enrollment_tool_handler(
     conductor: "EnrollmentConductor",
+    device_id: str,
     get_speaker_name: Optional[Callable[[], Optional[str]]] = None,
 ) -> Callable[["FunctionCallParams"], Awaitable[None]]:
     async def enrollment_tool_handler(params: "FunctionCallParams") -> None:
@@ -248,7 +252,11 @@ def create_enrollment_tool_handler(
                     )
                     return
                 await _set_wake_sound(False)
-                conductor.start(person)
+                if not conductor.start(person, device_id):
+                    await params.result_callback(
+                        {"error": "Voice training is already running on another device."}
+                    )
+                    return
                 await params.result_callback(
                     {"status": "guided session running on the device",
                      "instructions": (
@@ -259,6 +267,11 @@ def create_enrollment_tool_handler(
                      )}
                 )
             elif action == "stop":
+                if conductor.device_id != device_id:
+                    await params.result_callback(
+                        {"error": "Voice training is running on another device."}
+                    )
+                    return
                 await conductor.stop()
                 await _set_wake_sound(True)
                 await params.result_callback(
@@ -274,8 +287,9 @@ def create_enrollment_tool_handler(
         except Exception as e:
             logger.error(f"❌ voice_enrollment failed: {e}", exc_info=True)
             try:
-                await conductor.stop()
-                await _set_wake_sound(True)
+                if conductor.device_id == device_id:
+                    await conductor.stop()
+                    await _set_wake_sound(True)
             except Exception:
                 pass
             await params.result_callback(
@@ -305,6 +319,7 @@ class EnrollmentConductor:
         self.phrase = phrase or "your wake word"
         self.tts_voice = tts_voice or "fable"
         self._task = None
+        self.device_id: Optional[str] = None
         self.on_finished = None   # async callback(info: dict) after stop
 
     @property
@@ -335,14 +350,16 @@ class EnrollmentConductor:
         return pcm
 
     async def _say(self, text, device_id=None):
+        target = self.device_id if device_id is None else device_id
         pcm = await self._tts(text)
         for i in range(0, len(pcm), self.CHUNK):
-            await self.send_bytes(pcm[i:i + self.CHUNK], device_id)
+            await self.send_bytes(pcm[i:i + self.CHUNK], target)
             await asyncio.sleep(0.095)
 
-    def start(self, person):
+    def start(self, person, device_id: str):
         if self.running:
             return False
+        self.device_id = device_id
         self._task = asyncio.get_running_loop().create_task(self._run(person))
         return True
 
@@ -356,9 +373,10 @@ class EnrollmentConductor:
         await self._finish()
 
     async def _finish(self):
+        device_id = self.device_id
         info = self.recorder.stop() if self.recorder.active else {}
         try:
-            await self.send_json({"type": "enroll", "mode": "stop"})
+            await self.send_json({"type": "enroll", "mode": "stop"}, device_id)
         except Exception:
             pass
         if self.on_finished is not None and info.get("path"):
@@ -366,13 +384,15 @@ class EnrollmentConductor:
                 await self.on_finished(info)
             except Exception:
                 pass
+        await _set_wake_sound(True)
+        self.device_id = None
         return info
 
     async def _run(self, person):
         p = self.phrase
         try:
-            self.recorder.start(person)
-            await self.send_json({"type": "enroll", "mode": "start"})
+            self.recorder.start(person, self.device_id)
+            await self.send_json({"type": "enroll", "mode": "start"}, self.device_id)
             await asyncio.sleep(0.8)
             await self._say(
                 f"Voice training. Each time I say 'next', say '{p}' once, "

@@ -17,7 +17,8 @@ class RawAudioSerializer(FrameSerializer):
     the WebSocketHandler so they go out as TEXT frames, not binary.
     """
 
-    def __init__(self, input_sample_rate: int | None = None):
+    def __init__(self, device_id: str, input_sample_rate: int | None = None):
+        self._device_id = device_id
         # The Home Assistant Voice PE firmware (va_client) streams 16 kHz PCM16
         # mono from the XMOS mic. We tag incoming frames with the device's true
         # rate. NOTE: pipecat 0.0.97's input transport does NOT resample — the
@@ -72,9 +73,7 @@ class RawAudioSerializer(FrameSerializer):
         # alive and expects a pong; the reply used to be registered on an event
         # pipecat never fires, so no pong was ever sent.
         self._on_ping = None
-        # Called on any sign this device is the one being used (wake, button).
-        # Decides which device announcements and timers address when no
-        # explicit target is given.
+        # Called after a wake to select the default announcement target.
         self._on_activity = None
 
     def set_interrupt_handler(self, handler):
@@ -158,7 +157,11 @@ class RawAudioSerializer(FrameSerializer):
                 # in-flight audio 10 s into round one). Ignore interrupts while
                 # enrolling so the captured batch survives; the device-side mic
                 # close is recovered by a silent re-wake.
-                if self._enrollment_recorder is not None and self._enrollment_recorder.active:
+                if (
+                    self._enrollment_recorder is not None
+                    and self._enrollment_recorder.active
+                    and self._enrollment_recorder.device_id == self._device_id
+                ):
                     logger.info("🛑 device interrupt IGNORED (enrollment active)")
                     return None
                 logger.info("🛑 device interrupt received")
@@ -294,7 +297,11 @@ class RawAudioSerializer(FrameSerializer):
         # the recorder — OpenAI must not hear it (no VAD commits, no forced
         # responses, no cost). The device is in enrollment mode with its own
         # LED/phase; the pipeline simply sees silence.
-        if self._enrollment_recorder is not None and self._enrollment_recorder.active:
+        if (
+            self._enrollment_recorder is not None
+            and self._enrollment_recorder.active
+            and self._enrollment_recorder.device_id == self._device_id
+        ):
             self._enrollment_recorder.feed(message)
             return None
 
@@ -323,4 +330,3 @@ class RawAudioSerializer(FrameSerializer):
         # For other frame types, return empty bytes (not serialized)
         logger.debug(f"📤 Serializing non-audio frame: {type(frame).__name__}, returning empty bytes")
         return b""
-

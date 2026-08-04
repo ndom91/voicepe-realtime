@@ -10,7 +10,7 @@ from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineTask
 from pipecat.services.openai.realtime.llm import OpenAIRealtimeLLMService
 from app.mcp_service import HomeAssistantMCPService
-from app.phase_emitter import TURN_LIVENESS
+from app.phase_emitter import TurnLiveness
 from app.disconnect_tool import get_disconnect_tool_definition, create_disconnect_tool_handler
 from app.web_search_tool import get_web_search_tool_definition, create_web_search_tool_handler
 from app.audio_recording_service import AudioRecordingService
@@ -38,12 +38,6 @@ from app.enrollment import (
     get_false_alarm_tool_definition,
     create_false_alarm_tool_handler,
 )
-
-# Speaker context v1 (fork): set at startup when speaker names are configured.
-# Module-level so SafeRealtimeLLMService.register_function can gate tools
-# without threading state through pipecat.
-SPEAKER_PROBE = None
-MALE_ONLY_TOOLS: set = set()
 
 # Configure logging
 logging.basicConfig(
@@ -233,7 +227,7 @@ class SafeRealtimeLLMService(OpenAIRealtimeLLMService):
         killing them halfway. This single override covers every registration
         path (MCP tools via pipecat's MCPClient, web_search, disconnect).
 
-        The handler is also wrapped to tick TURN_LIVENESS around its run, so
+        The handler is also wrapped to tick its connection's liveness around its run, so
         the PhaseEmitter's thinking-watchdog knows a tool is in flight and a
         slow tool (web search: 10-20 s of pipeline silence) is never mistaken
         for a dead turn. All our handlers use the single-param
@@ -246,10 +240,10 @@ class SafeRealtimeLLMService(OpenAIRealtimeLLMService):
             # the model — so prompt tricks can't bypass it. Fails closed on
             # uncertain/stale/absent verdicts. This is convenience gating on a
             # voice-type heuristic, not biometric auth.
-            if MALE_ONLY_TOOLS and function_name in MALE_ONLY_TOOLS:
-                speaker = SPEAKER_PROBE.gate_speaker() if SPEAKER_PROBE else "unknown"
+            if self.male_only_tools and function_name in self.male_only_tools:
+                speaker = self.speaker_probe.gate_speaker() if self.speaker_probe else "unknown"
                 if speaker != "male":
-                    owner = (SPEAKER_PROBE.male_name if SPEAKER_PROBE else "") or "the owner"
+                    owner = (self.speaker_probe.male_name if self.speaker_probe else "") or "the owner"
                     logger.info(f"⛔ speaker gate blocked '{function_name}' (speaker={speaker})")
                     await params.result_callback({
                         "error": (
@@ -259,11 +253,11 @@ class SafeRealtimeLLMService(OpenAIRealtimeLLMService):
                         )
                     })
                     return
-            TURN_LIVENESS.tool_started()
+            self.turn_liveness.tool_started()
             try:
                 return await handler(params)
             finally:
-                TURN_LIVENESS.tool_finished()
+                self.turn_liveness.tool_finished()
 
         super().register_function(
             function_name, liveness_tracked, start_callback, cancel_on_interruption=False
@@ -308,6 +302,9 @@ class Application:
         self.audio_recording_service: Optional[AudioRecordingService] = None
         self.session_manager: Optional[SessionManager] = None
         self._pipeline_lock: Optional[asyncio.Lock] = None
+        self.speaker_male_name = ""
+        self.speaker_female_name = ""
+        self.male_only_tools: set[str] = set()
         
     async def initialize(self) -> None:
         """Initialize all components."""
@@ -516,12 +513,11 @@ class Application:
             f"wake-open delay {wake_open_delay_ms}ms, "
             f"playback prebuffer {playback_prebuffer_ms}ms"
         )
-        # Speaker context v1 (fork): enabled when at least one name is set.
-        global SPEAKER_PROBE, MALE_ONLY_TOOLS
+        # Speaker probes are created per connection when a session starts.
+        self.speaker_male_name = speaker_male_name
+        self.speaker_female_name = speaker_female_name
+        self.male_only_tools = male_only_tools
         if speaker_male_name or speaker_female_name:
-            SPEAKER_PROBE = SpeakerProbe(speaker_male_name, speaker_female_name)
-            MALE_ONLY_TOOLS = male_only_tools
-            self.websocket_handler.speaker_probe = SPEAKER_PROBE
             logger.info(
                 f"🗣️ Speaker context enabled: male={speaker_male_name or '-'} "
                 f"female={speaker_female_name or '-'}"
@@ -608,8 +604,8 @@ class Application:
                 if ser is not None:
                     ser.suppress_inbound_until = _t.monotonic() + 1.2
         self.timer_registry.announcer = _guarded_say
-        self.timer_registry.get_owner = (
-            lambda: SPEAKER_PROBE.name_for(SPEAKER_PROBE.gate_speaker()) if SPEAKER_PROBE else None
+        self.timer_registry.get_owner = lambda: self._speaker_name(
+            self.websocket_handler.resolve_device()
         )
         def _last_wake_any_device() -> float:
             # The most recent wake/button across ALL devices: a timer must not
@@ -644,8 +640,6 @@ class Application:
         elif announce_port or announce_token:
             logger.warning("⚠️ announce endpoint needs BOTH announce_port and announce_token — disabled")
 
-        # Transports are created per connection now, not once at startup.
-        
         # Store configuration for session creation
         self.openai_api_key = openai_api_key
         self.vad_threshold = vad_threshold
@@ -682,6 +676,11 @@ class Application:
     def _update_session_activity(self):
         """Update session activity timestamp (called by SessionActivityTracker)."""
         pass
+
+    def _speaker_name(self, connection) -> Optional[str]:
+        """Return the current speaker name for one connection."""
+        probe = getattr(connection, "speaker_probe", None)
+        return probe.name_for(probe.gate_speaker()) if probe else None
     
     async def create_openai_service(self, connection):
         """Create an OpenAI Realtime session for ONE device.
@@ -890,6 +889,16 @@ class Application:
                 session_properties=session_properties,
                 start_audio_paused=False
             )
+            service.speaker_probe = None
+            service.male_only_tools = set()
+            connection.turn_liveness = TurnLiveness()
+            service.turn_liveness = connection.turn_liveness
+            if self.speaker_male_name or self.speaker_female_name:
+                connection.speaker_probe = SpeakerProbe(
+                    self.speaker_male_name, self.speaker_female_name
+                )
+                service.speaker_probe = connection.speaker_probe
+                service.male_only_tools = self.male_only_tools
             logger.info(f"✅ OpenAI Service created: {type(service).__name__}")
             
             # Register disconnect tool handler (only when the tool is exposed)
@@ -909,13 +918,12 @@ class Application:
             # Register voice enrollment tool handler (fork). The speaker-name
             # getter lets the tool default to the voice-identified person.
             def _current_speaker_name():
-                if SPEAKER_PROBE is None:
-                    return None
-                return SPEAKER_PROBE.name_for(SPEAKER_PROBE.gate_speaker())
+                return self._speaker_name(connection)
 
             service.register_function(
-                "voice_enrollment",
-                create_enrollment_tool_handler(self.enrollment_conductor, _current_speaker_name),
+                "voice_enrollment", create_enrollment_tool_handler(
+                    self.enrollment_conductor, connection.device_id, _current_speaker_name
+                ),
             )
             logger.info("✅ Registered voice_enrollment tool handler")
             service.register_function(
@@ -1012,13 +1020,11 @@ class Application:
             if self.audio_recording_service:
                 self.audio_recording_service.start_new_session(device_id)
 
-        def _on_client_disconnected(device_id: str):
+        def _on_client_disconnected(connection):
             if self.session_manager:
-                # Cache THIS device's context off THIS device's service, so a
-                # reconnect resumes its own conversation rather than whichever
-                # session happened to be current.
-                service = self.session_manager.get_current_service(device_id)
-                self.session_manager.handle_client_disconnect(device_id, service)
+                self.session_manager.handle_client_disconnect(
+                    connection.device_id, connection.openai_service
+                )
             if self.audio_recording_service:
                 self.audio_recording_service.stop_recording()
 

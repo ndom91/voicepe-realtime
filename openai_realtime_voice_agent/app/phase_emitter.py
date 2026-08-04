@@ -49,7 +49,7 @@ IMPORTANT — thinking watchdog + forced idle (v0.5.3):
     2. A thinking watchdog — if `thinking` sees no model activity for
        THINKING_TIMEOUT_S it forces idle as a generic safety net (covers
        turn deaths that produce no ErrorFrame at all). While a tool call is
-       in flight (TURN_LIVENESS; tool handlers are wrapped in
+        in flight (tool handlers update this emitter's liveness signal through
        SafeRealtimeLLMService.register_function to tick it) the watchdog
        WAITS WITH NO CAP — explicit user decision 2026-06-12: a long web
        search on a hard question must get all the time it needs, the user
@@ -79,14 +79,13 @@ logger = logging.getLogger(__name__)
 
 
 class TurnLiveness:
-    """Shared "is the model still doing something?" signal for the watchdog.
+    """"Is the model still doing something?" signal for one watchdog.
 
     Tool handlers are wrapped (see SafeRealtimeLLMService.register_function in
     main.py) to tick this on start/finish. The PhaseEmitter's thinking
     watchdog reads it so a slow tool — web search regularly takes 10-20 s with
     zero pipeline traffic — is never mistaken for a dead turn, and so each
-    step of a long tool chain refreshes the window. Module-level singleton:
-    one pipeline per process.
+    step of a long tool chain refreshes the window.
     """
 
     def __init__(self) -> None:
@@ -100,9 +99,6 @@ class TurnLiveness:
     def tool_finished(self) -> None:
         self.in_flight = max(0, self.in_flight - 1)
         self.last_activity = time.monotonic()
-
-
-TURN_LIVENESS = TurnLiveness()
 
 
 class PhaseEmitter(FrameProcessor):
@@ -119,7 +115,7 @@ class PhaseEmitter(FrameProcessor):
     # How often to log that we're deliberately waiting on a running tool.
     INFLIGHT_LOG_EVERY_S = 30.0
 
-    def __init__(self, send_phase, idle_debounce_s: float = None, **kwargs):
+    def __init__(self, send_phase, idle_debounce_s: float = None, liveness=None, **kwargs):
         """
         Args:
             send_phase: async callable(value: str) that delivers the phase to
@@ -132,6 +128,7 @@ class PhaseEmitter(FrameProcessor):
         """
         super().__init__(**kwargs)
         self._send_phase = send_phase
+        self._liveness = liveness or TurnLiveness()
         if idle_debounce_s is None:
             try:
                 idle_debounce_s = float(os.environ.get("PHASE_IDLE_DEBOUNCE_MS", "1500")) / 1000.0
@@ -239,7 +236,7 @@ class PhaseEmitter(FrameProcessor):
         # while a tool is in flight); the tool's result response then flips the
         # phase to `replying`. Fast tools never reach here — their result reply
         # cancels this debounce first.
-        if TURN_LIVENESS.in_flight > 0:
+        if self._liveness.in_flight > 0:
             await self._emit("thinking")
             self._arm_watchdog()
             return
@@ -255,8 +252,8 @@ class PhaseEmitter(FrameProcessor):
                 if self._current != "thinking":
                     return  # phase moved on — turn is alive, watchdog done
                 now = time.monotonic()
-                last = max(armed_at, TURN_LIVENESS.last_activity)
-                if TURN_LIVENESS.in_flight > 0:
+                last = max(armed_at, self._liveness.last_activity)
+                if self._liveness.in_flight > 0:
                     # A tool is running — the turn is alive by definition, and
                     # a long web search must get all the time it needs (no
                     # cap; see the module docstring). Log occasionally so a
@@ -264,7 +261,7 @@ class PhaseEmitter(FrameProcessor):
                     if now - last_inflight_log >= self.INFLIGHT_LOG_EVERY_S:
                         last_inflight_log = now
                         logger.info(
-                            f"⏳ thinking-watchdog: {TURN_LIVENESS.in_flight} tool(s) "
+                            f"⏳ thinking-watchdog: {self._liveness.in_flight} tool(s) "
                             f"running for {now - last:.0f}s — waiting (no cap)"
                         )
                     continue

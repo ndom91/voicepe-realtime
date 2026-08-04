@@ -11,6 +11,7 @@ from app.device_registry import (
     device_id_from_websocket,
     sanitize_device_id,
 )
+from app.session_manager import SessionManager
 
 
 class FakeURL:
@@ -75,6 +76,19 @@ async def main():
     assert await reg.remove(kitchen2) is True
     assert reg.get("kitchen") is None
     print("lifecycle     -> reconnect replaces; late disconnect can't evict the live socket")
+
+    # A late cleanup for the displaced session must not remove the replacement
+    # from SessionManager's per-device service map.
+    sessions = SessionManager()
+    old_service = object()
+    new_service = object()
+    sessions.set_current_service("kitchen", old_service)
+    sessions.set_current_service("kitchen", new_service)
+    sessions.handle_client_disconnect("kitchen", old_service)
+    assert sessions.get_current_service("kitchen") is new_service
+    sessions.handle_client_disconnect("kitchen", new_service)
+    assert sessions.get_current_service("kitchen") is None
+    print("sessions      -> stale cleanup preserves the replacement service")
 
     # --- frame formatting -------------------------------------------------
     ws = FakeWS()

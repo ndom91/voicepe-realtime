@@ -150,4 +150,5 @@ fi
 
 # Start the application
 export PYTHONUNBUFFERED=1
+cd /app
 exec python3 -m app.main

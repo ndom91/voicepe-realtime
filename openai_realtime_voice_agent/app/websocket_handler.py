@@ -392,30 +392,15 @@ class WebSocketHandler:
         self.openai_service_factory: Optional[Callable[[DeviceConnection], Awaitable[Any]]] = None
         # Which device's audio the (single-file) recorder is following.
         self._recording_owner: Optional[str] = None
-        # Shared, device-agnostic services, set by main.py.
-        self.speaker_probe = None
-        self.enrollment_recorder = None
-        self.enrollment_conductor = None
-        # Speaker context v1 (fork): set by main.py when speaker names are
-        # configured; wired to the serializer + OpenAI service in build_pipeline.
-        self.speaker_probe = None
-        # Voice enrollment recorder (fork): set by main.py; the serializer feeds
-        # it every inbound mic frame while an enrollment session is active.
+        # Voice enrollment remains single-user, but is explicitly targeted to
+        # the connection that starts it.
         self.enrollment_recorder = None
         self.enrollment_conductor = None
     
     def create_transport(
         self, websocket, serializer: RawAudioSerializer
     ) -> MixedFastAPIWebsocketTransport:
-        """
-        Create a transport for ONE device connection.
-
-        Previously this built a single process-wide WebsocketServerTransport
-        that owned the listening socket. That transport is single-client: it
-        closes the incumbent connection whenever a new one arrives, so two
-        devices could never be connected at once. The listening socket now
-        belongs to the FastAPI app, and each accepted connection gets its own
-        transport instead.
+        """Create a transport for one accepted connection.
 
         Args:
             websocket: The accepted FastAPI/starlette WebSocket.
@@ -441,11 +426,7 @@ class WebSocketHandler:
         connection: DeviceConnection,
         activity_callback: Optional[Callable[[], None]] = None
     ) -> tuple[Pipeline, PipelineRunner, PipelineTask]:
-        """
-        Build the pipeline for ONE device connection.
-
-        Everything this pipeline touches comes from `connection`, so two
-        devices never share a serializer, a session, or a phase channel.
+        """Build the pipeline from one connection's resources.
 
         Args:
             connection: The device's connection, with its transport,
@@ -492,7 +473,9 @@ class WebSocketHandler:
         # idle through PhaseEmitter.force_idle() (consistent phase state +
         # racing-`thinking` suppression); it is APPENDED near the end of the
         # pipeline below, before transport.output().
-        phase_emitter = PhaseEmitter(send_phase=send_phase)
+        phase_emitter = PhaseEmitter(
+            send_phase=send_phase, liveness=connection.turn_liveness
+        )
 
         pipeline_components = [
             transport.input(),
@@ -580,9 +563,6 @@ class WebSocketHandler:
         runner = PipelineRunner(handle_sigint=False)
         task = PipelineTask(pipeline, idle_timeout_secs=None, cancel_on_idle_timeout=False)
 
-        # NB: the runner is NOT started here. serve_connection awaits it, so the
-        # endpoint coroutine stays alive for as long as the device is connected
-        # (returning early would make FastAPI close the socket).
         logger.info(f"✅ Pipeline built for {client_id}")
 
         # Wire the device "stop" interrupt. The serializer calls this when it
@@ -777,7 +757,7 @@ class WebSocketHandler:
             # not have it yet — follow-ups and later turns do. Gating of
             # speaker-restricted tools does NOT depend on this injection (see
             # SafeRealtimeLLMService.register_function in main.py).
-            if self.speaker_probe is not None and self.speaker_probe.enabled:
+            if connection.speaker_probe is not None and connection.speaker_probe.enabled:
                 from .speaker_context import verdict_text
 
                 async def _on_speaker_verdict(label, name, f0):
@@ -789,7 +769,7 @@ class WebSocketHandler:
                                     role="system",
                                     content=[openai_rt_events.ItemContent(
                                         type="input_text",
-                                        text=verdict_text(self.speaker_probe, label, name, f0),
+                                        text=verdict_text(connection.speaker_probe, label, name, f0),
                                     )],
                                 )
                             )
@@ -797,8 +777,8 @@ class WebSocketHandler:
                     except Exception as e:
                         logger.warning(f"⚠️ speaker verdict injection failed: {e!r}")
 
-                self.speaker_probe.on_verdict = _on_speaker_verdict
-                serializer.set_speaker_probe(self.speaker_probe)
+                connection.speaker_probe.on_verdict = _on_speaker_verdict
+                serializer.set_speaker_probe(connection.speaker_probe)
 
             if self.enrollment_recorder is not None:
                 serializer.set_enrollment_recorder(self.enrollment_recorder)
@@ -827,7 +807,8 @@ class WebSocketHandler:
 
             if self.enrollment_conductor is not None:
                 async def _on_device_enroll_stopped():
-                    await self.enrollment_conductor.stop()
+                    if self.enrollment_conductor.device_id == connection.device_id:
+                        await self.enrollment_conductor.stop()
                 serializer.set_enroll_stopped_handler(_on_device_enroll_stopped)
 
         return pipeline, runner, task
@@ -985,7 +966,7 @@ class WebSocketHandler:
         self,
         websocket,
         on_client_connected: Optional[Callable[[str], Awaitable[None]]] = None,
-        on_client_disconnected: Optional[Callable[[str], None]] = None,
+        on_client_disconnected: Optional[Callable[[DeviceConnection], None]] = None,
         activity_callback: Optional[Callable[[], None]] = None,
     ) -> None:
         """Own one device connection from accept to close.
@@ -999,14 +980,14 @@ class WebSocketHandler:
         Args:
             websocket: The FastAPI/starlette WebSocket, not yet accepted.
             on_client_connected: Optional async callback(device_id).
-            on_client_disconnected: Optional callback(device_id).
+            on_client_disconnected: Optional callback(connection).
             activity_callback: Optional session-activity callback.
         """
         await websocket.accept()
         device_id = device_id_from_websocket(websocket)
         logger.info(f"🔗 device {device_id} connected ({len(self.devices) + 1} total)")
 
-        serializer = RawAudioSerializer()
+        serializer = RawAudioSerializer(device_id)
         connection = DeviceConnection(
             device_id=device_id, websocket=websocket, serializer=serializer
         )
@@ -1035,15 +1016,22 @@ class WebSocketHandler:
             connection.runner = runner
             connection.task = task
 
+            @connection.transport.event_handler("on_client_disconnected")
+            async def _stop_disconnected_task(_websocket):
+                # Pipecat's FastAPI input transport signals this event but does
+                # not stop PipelineRunner itself. Cancel only this device's task
+                # so serve_connection reaches its per-device cleanup.
+                await task.cancel()
+
             displaced = await self.devices.add(connection)
             await connection.send_json(self.hello_payload())
-
-            if on_client_connected:
-                await on_client_connected(device_id)
 
             if displaced is not None:
                 await self._teardown(displaced)
                 displaced = None
+
+            if on_client_connected:
+                await on_client_connected(device_id)
 
             # Blocks until the device disconnects (or the pipeline ends).
             await runner.run(task)
@@ -1052,11 +1040,21 @@ class WebSocketHandler:
         except Exception as e:
             logger.error(f"❌ connection for {device_id} failed: {e!r}", exc_info=True)
         finally:
-            await self.devices.remove(connection)
-            self._release_recording(device_id)
-            if on_client_disconnected:
+            removed = await self.devices.remove(connection)
+            if not removed and connection.openai_service is not None and self.session_manager:
+                self.session_manager.handle_client_disconnect(
+                    connection.device_id, connection.openai_service
+                )
+            if removed:
+                self._release_recording(device_id)
+                if (
+                    self.enrollment_conductor is not None
+                    and self.enrollment_conductor.device_id == device_id
+                ):
+                    await self.enrollment_conductor.stop()
+            if removed and on_client_disconnected:
                 try:
-                    on_client_disconnected(device_id)
+                    on_client_disconnected(connection)
                 except Exception as e:
                     logger.warning(f"⚠️ disconnect callback for {device_id} failed: {e!r}")
             await self._teardown(connection)
