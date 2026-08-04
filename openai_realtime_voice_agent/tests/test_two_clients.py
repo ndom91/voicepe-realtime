@@ -145,6 +145,21 @@ async def main():
             assert handler.devices.ids() == ["kitchen"], handler.devices.ids()
             print(f"cleanup  -> office removed on disconnect: {handler.devices.ids()}")
 
+        # Unflashed firmware sends no device_id and must still work: the id
+        # falls back to the client IP, which is distinct per device, so two
+        # legacy devices still get separate identities and never evict each
+        # other. This is the configuration a stock device actually runs.
+        async with websockets.connect(f"ws://127.0.0.1:{PORT}/") as legacy:
+            assert json.loads(await asyncio.wait_for(legacy.recv(), 5))["type"] == "hello"
+            await asyncio.sleep(0.3)
+            ids = handler.devices.ids()
+            assert ids == ["127.0.0.1"], ids
+            print(f"legacy   -> no device_id falls back to client IP: {ids}")
+            await legacy.send(json.dumps({"type": "ping"}))
+            assert json.loads(await asyncio.wait_for(legacy.recv(), 5)) == {"type": "pong"}
+            print("legacy   -> ping/pong works without a device_id")
+        await asyncio.sleep(0.5)
+
         await asyncio.sleep(0.5)
         assert handler.devices.ids() == [], handler.devices.ids()
         print("cleanup  -> kitchen removed on disconnect")
