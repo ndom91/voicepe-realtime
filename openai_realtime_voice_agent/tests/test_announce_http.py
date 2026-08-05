@@ -26,7 +26,7 @@ async def main():
         return True
 
     runner = await announce_http.start_announce_server(
-        0, "test-token", announce, lambda device_id: device_id == "kitchen"
+        0, "test-token", announce, lambda device_id: device_id in {"kitchen", "office"}
     )
     site = next(iter(runner.sites))
     port = site._server.sockets[0].getsockname()[1]
@@ -48,7 +48,15 @@ async def main():
             assert response.status == 200
             assert (await response.json())["status"] == "announced"
             response.release()
-        assert attempts == [("Dinner is ready", "kitchen")] * 2
+            payload["device_id"] = "office"
+            async with session.post(f"http://127.0.0.1:{port}/announce", json=payload, headers=headers) as response:
+                assert response.status == 200
+                assert (await response.json())["status"] == "announced"
+        assert attempts == [
+            ("Dinner is ready", "kitchen"),
+            ("Dinner is ready", "kitchen"),
+            ("Dinner is ready", "office"),
+        ]
     finally:
         await runner.cleanup()
 

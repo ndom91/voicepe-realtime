@@ -27,8 +27,8 @@ MAX_MESSAGE_CHARS = 600
 # accepted-but-not-spoken so the caller doesn't retry.
 DUPLICATE_WINDOW_S = 600
 DUPLICATE_RATIO = 0.75
-_recent: list = []  # (monotonic, normalized_text)
-_pending: list = []  # normalized_texts currently being delivered
+_recent: list = []  # (monotonic, device_id, normalized_text)
+_pending: list = []  # (device_id, normalized_text) currently being delivered
 _announce_lock = asyncio.Lock()
 
 
@@ -54,13 +54,13 @@ async def start_announce_server(port: int, token: str, announcer, is_connected) 
         norm = " ".join(message.lower().split())
         async with _announce_lock:
             now = time.monotonic()
-            _recent[:] = [(t, m) for t, m in _recent if now - t < DUPLICATE_WINDOW_S]
-            for prev in [m for _, m in _recent] + _pending:
-                if difflib.SequenceMatcher(None, norm, prev).ratio() >= DUPLICATE_RATIO:
+            _recent[:] = [(t, target, m) for t, target, m in _recent if now - t < DUPLICATE_WINDOW_S]
+            for cached_device_id, prev in [(target, m) for _, target, m in _recent] + _pending:
+                if cached_device_id == device_id and difflib.SequenceMatcher(None, norm, prev).ratio() >= DUPLICATE_RATIO:
                     logger.info(f"📢 duplicate announce suppressed: {message[:60]}")
                     return web.json_response({"status": "duplicate_suppressed",
                                               "note": "already announced — do not retry or re-announce"})
-            _pending.append(norm)
+            _pending.append((device_id, norm))
         logger.info(f"📢 announce{f' [{device_id}]' if device_id else ''}: {message[:80]}")
         delivered = False
         try:
@@ -70,9 +70,9 @@ async def start_announce_server(port: int, token: str, announcer, is_connected) 
             return web.json_response({"error": "announcement failed"}, status=500)
         finally:
             async with _announce_lock:
-                _pending.remove(norm)
+                _pending.remove((device_id, norm))
                 if delivered:
-                    _recent.append((time.monotonic(), norm))
+                    _recent.append((time.monotonic(), device_id, norm))
         if not delivered:
             return web.json_response({"error": "announcement failed"}, status=503)
         return web.json_response({"status": "announced", "device_id": device_id})
