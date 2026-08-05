@@ -232,17 +232,13 @@ Once the basics work, the fun starts. Each of these has a full guide in
 
 ## Part 6 — Multiple devices
 
-One add-on instance serves **one** device. For a second Voice PE:
+One add-on instance serves **multiple** Voice PE devices. Point every device's
+`va_url` at the same add-on port (for example, `ws://<ha-host>:8080/`). Each
+device gets an independent OpenAI session, conversation history, audio stream,
+speaker-recognition state, and enrollment flow, so people can use different
+rooms at the same time.
 
-1. Install a copy of this add-on as a
-   [local add-on](https://developers.home-assistant.io/docs/add-ons/tutorial/):
-   copy `openai_realtime_voice_agent/` into `/addons`, and change `slug` and `name`
-   in its `config.yaml`.
-2. Give the copy a different `websocket_port` (e.g. `8082` — avoid `8081`, used by
-   dev builds).
-3. Point the second device's `va_url` at that port
-   (`ws://<ha-host>:8082/` in its firmware stub).
-
-Each instance gets its own configuration — different rooms can have different
-personas, voices, and `instance_name` sensor prefixes. Memory
-(`/share/voice-memory/`) is shared by all instances.
+All devices in an instance share its configuration: persona, voice, Home
+Assistant access, and `instance_name` sensor prefix. Run separate add-on
+instances only when rooms need different configuration; assign each extra
+instance a unique `websocket_port` (avoid `8081`, used by dev builds).

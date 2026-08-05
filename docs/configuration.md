@@ -80,7 +80,7 @@ Two places hold configuration:
 
 | Option | Default | Purpose / when to change |
 |---|---|---|
-| `websocket_port` | `8080` | The port the Voice PE connects to. Must match the `va_url` in the device firmware. Change only on a port clash (and for second devices — see [multi-device](getting-started.md#part-6--multiple-devices)); `8081` is used by dev builds. |
+| `websocket_port` | `8080` | The port Voice PE devices connect to. Must match each device's `va_url` in its firmware. One add-on instance accepts multiple devices on this port; change it only on a port clash. `8081` is used by dev builds. |
 | `session_reuse_timeout_seconds` | `300` | If the device reconnects within this window (Wi-Fi blip, add-on restart), the conversation resumes where it left off. `0` = always start fresh. |
 | `max_context_messages` | `12` | How many recent exchanges the session keeps. More = better in-conversation memory, but every answer re-bills the whole history — long chats get expensive and can hit rate limits. `0` = unlimited. |
 | `transcription_model` | `gpt-4o-transcribe` | Writes your speech into the log when `transcription_language` is set. Does **not** affect understanding — the main model hears your audio natively. Also: `gpt-realtime-whisper`, `gpt-4o-mini-transcribe`, `whisper-1`. |
