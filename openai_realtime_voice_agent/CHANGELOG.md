@@ -10,6 +10,9 @@ All notable changes to this add-on. Newest first.
   the same time without interrupting or receiving audio from one another.
 - Reconnecting a device replaces only its own stale connection; other active
   devices keep their conversations intact.
+- Timer announcements and acknowledgements stay with the device that created
+  the timer. Targeted announce requests now return an error when that device
+  is offline rather than reporting a false success.
 
 ## 0.16.7 (fork)
 

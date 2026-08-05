@@ -28,9 +28,11 @@ MAX_MESSAGE_CHARS = 600
 DUPLICATE_WINDOW_S = 600
 DUPLICATE_RATIO = 0.75
 _recent: list = []  # (monotonic, normalized_text)
+_pending: list = []  # normalized_texts currently being delivered
+_announce_lock = asyncio.Lock()
 
 
-async def start_announce_server(port: int, token: str, announcer, is_connected) -> None:
+async def start_announce_server(port: int, token: str, announcer, is_connected) -> web.AppRunner:
     async def handle(request: web.Request) -> web.Response:
         auth = request.headers.get("Authorization", "")
         if auth != f"Bearer {token}":
@@ -42,27 +44,37 @@ async def start_announce_server(port: int, token: str, announcer, is_connected) 
         message = (body.get("message") or "").strip()[:MAX_MESSAGE_CHARS]
         if not message:
             return web.json_response({"error": "empty message"}, status=400)
-        if not is_connected():
-            return web.json_response({"error": "no device connected"}, status=503)
-        now = time.monotonic()
-        norm = " ".join(message.lower().split())
-        _recent[:] = [(t, m) for t, m in _recent if now - t < DUPLICATE_WINDOW_S]
-        for _, prev in _recent:
-            if difflib.SequenceMatcher(None, norm, prev).ratio() >= DUPLICATE_RATIO:
-                logger.info(f"📢 duplicate announce suppressed: {message[:60]}")
-                return web.json_response({"status": "duplicate_suppressed",
-                                          "note": "already announced — do not retry or re-announce"})
-        _recent.append((now, norm))
         # Optional room selection. With several devices connected, "the
         # device" is ambiguous: an explicit device_id names the room, and
         # omitting it speaks on whichever device was last used.
         device_id = (body.get("device_id") or "").strip() or None
+        if not is_connected(device_id):
+            error = "device not connected" if device_id else "no device connected"
+            return web.json_response({"error": error, "device_id": device_id}, status=503)
+        norm = " ".join(message.lower().split())
+        async with _announce_lock:
+            now = time.monotonic()
+            _recent[:] = [(t, m) for t, m in _recent if now - t < DUPLICATE_WINDOW_S]
+            for prev in [m for _, m in _recent] + _pending:
+                if difflib.SequenceMatcher(None, norm, prev).ratio() >= DUPLICATE_RATIO:
+                    logger.info(f"📢 duplicate announce suppressed: {message[:60]}")
+                    return web.json_response({"status": "duplicate_suppressed",
+                                              "note": "already announced — do not retry or re-announce"})
+            _pending.append(norm)
         logger.info(f"📢 announce{f' [{device_id}]' if device_id else ''}: {message[:80]}")
+        delivered = False
         try:
-            await announcer(message, device_id)
+            delivered = await announcer(message, device_id)
         except Exception as e:
             logger.warning(f"⚠️ announce failed: {e!r}")
             return web.json_response({"error": "announcement failed"}, status=500)
+        finally:
+            async with _announce_lock:
+                _pending.remove(norm)
+                if delivered:
+                    _recent.append((time.monotonic(), norm))
+        if not delivered:
+            return web.json_response({"error": "announcement failed"}, status=503)
         return web.json_response({"status": "announced", "device_id": device_id})
 
     app = web.Application()
@@ -72,3 +84,4 @@ async def start_announce_server(port: int, token: str, announcer, is_connected) 
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
     logger.info(f"📢 Announce endpoint listening on :{port}/announce")
+    return runner

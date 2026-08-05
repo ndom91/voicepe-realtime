@@ -353,8 +353,10 @@ class EnrollmentConductor:
         target = self.device_id if device_id is None else device_id
         pcm = await self._tts(text)
         for i in range(0, len(pcm), self.CHUNK):
-            await self.send_bytes(pcm[i:i + self.CHUNK], target)
+            if not await self.send_bytes(pcm[i:i + self.CHUNK], target):
+                return False
             await asyncio.sleep(0.095)
+        return True
 
     def start(self, person, device_id: str):
         if self.running:

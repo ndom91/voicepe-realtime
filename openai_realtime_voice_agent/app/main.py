@@ -599,30 +599,25 @@ class Application:
             if ser is not None:
                 ser.suppress_inbound_until = _t.monotonic() + 3600
             try:
-                await self.enrollment_conductor._say(text, device_id=device_id)
+                return await self.enrollment_conductor._say(text, device_id=device_id)
             finally:
                 if ser is not None:
                     ser.suppress_inbound_until = _t.monotonic() + 1.2
         self.timer_registry.announcer = _guarded_say
-        self.timer_registry.get_owner = lambda: self._speaker_name(
-            self.websocket_handler.resolve_device()
+        self.timer_registry.get_owner = lambda device_id: self._speaker_name(
+            self.websocket_handler.resolve_device(device_id)
         )
-        def _last_wake_any_device() -> float:
-            # The most recent wake/button across ALL devices: a timer must not
-            # ring over someone mid-turn in another room either.
-            latest = 0.0
-            for connection in self.websocket_handler.devices:
-                ser = connection.serializer
-                if ser is None:
-                    continue
-                latest = max(
-                    latest,
-                    getattr(ser, "_last_wake_mono", 0.0),
-                    getattr(ser, "_last_button_mono", 0.0),
-                )
-            return latest
+        def _last_wake(device_id: str) -> float:
+            connection = self.websocket_handler.resolve_device(device_id)
+            ser = connection.serializer if connection else None
+            if ser is None:
+                return 0.0
+            return max(
+                getattr(ser, "_last_wake_mono", 0.0),
+                getattr(ser, "_last_button_mono", 0.0),
+            )
 
-        self.timer_registry.last_wake = _last_wake_any_device
+        self.timer_registry.last_wake = _last_wake
 
         # Announce endpoint (fork): a LAN route back to the device so the
         # household's agent can speak results of long-running work. Reuses the
@@ -632,10 +627,7 @@ class Application:
         if announce_port and announce_token:
             await start_announce_server(
                 announce_port, announce_token, _guarded_say,
-                # "Is a device reachable?" — true while any device is
-                # connected. The endpoint accepts an optional device_id to
-                # choose the room; without one it speaks on the last-active.
-                lambda: len(self.websocket_handler.devices) > 0,
+                lambda device_id: self.websocket_handler.resolve_device(device_id) is not None,
             )
         elif announce_port or announce_token:
             logger.warning("⚠️ announce endpoint needs BOTH announce_port and announce_token — disabled")
@@ -929,7 +921,7 @@ class Application:
             service.register_function(
                 "mark_false_wake", create_false_alarm_tool_handler()
             )
-            register_timer_tools(service, self.timer_registry)
+            register_timer_tools(service, self.timer_registry, connection.device_id)
             register_memory_tools(service, _current_speaker_name)
             if openclaw_url():
                 register_openclaw_tool(service)
