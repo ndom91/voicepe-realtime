@@ -53,7 +53,9 @@ class MixedFastAPIWebsocketClient(FastAPIWebsocketClient):
         while True:
             try:
                 message = await self._websocket.receive()
-            except (RuntimeError, asyncio.CancelledError):
+            except asyncio.CancelledError:
+                raise
+            except RuntimeError:
                 # starlette raises RuntimeError if receive() is called once the
                 # socket has already gone away. Treat it as end-of-stream so the
                 # input transport runs its normal disconnect path.

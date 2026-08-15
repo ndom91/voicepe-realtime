@@ -319,6 +319,20 @@ class ConnectionRecovery(FrameProcessor):
             except Exception as e:
                 logger.warning(f"⚠️ proactive refresh loop error: {e!r}")
 
+    async def close(self) -> None:
+        """Stop background work owned by this pipeline processor."""
+        task = self._refresh_task
+        self._refresh_task = None
+        if task is None:
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.debug(f"proactive refresh task shutdown: {e!r}")
+
     async def _go_idle(self, reason: str) -> None:
         """Put the device in idle for a dead turn — via PhaseEmitter when wired."""
         if self._phase_emitter is not None:
@@ -477,14 +491,16 @@ class WebSocketHandler:
             send_phase=send_phase, liveness=connection.turn_liveness
         )
 
+        connection.recovery = ConnectionRecovery(
+            openai_service=openai_service, emit_idle=send_phase,
+            phase_emitter=phase_emitter,
+        )
         pipeline_components = [
             transport.input(),
             # Watch for OpenAI connection-death ErrorFrames (they travel upstream
             # to the task source, so place this upstream of the service) and
             # reconnect in place. Without it a 1011/1001 drop bricks the session.
-            (connection_recovery := ConnectionRecovery(
-                openai_service=openai_service, emit_idle=send_phase,
-                phase_emitter=phase_emitter)),
+            connection.recovery,
             InputResampler(out_rate=PIPELINE_SAMPLE_RATE),
             input_activity_tracker,
         ]
@@ -921,7 +937,10 @@ class WebSocketHandler:
         if not self.audio_recording_service:
             return False
         if self._recording_owner in (None, device_id):
+            newly_claimed = self._recording_owner is None
             self._recording_owner = device_id
+            if newly_claimed:
+                self.audio_recording_service.start_new_session(device_id)
             return True
         logger.info(
             f"🎙️ audio recording is already following {self._recording_owner}; "
@@ -936,6 +955,7 @@ class WebSocketHandler:
             device_id: The departing device.
         """
         if self._recording_owner == device_id:
+            self.audio_recording_service.stop_recording()
             self._recording_owner = None
 
     # ------------------------------------------------------------------
@@ -1071,6 +1091,9 @@ class WebSocketHandler:
                 await connection.task.cancel()
             except Exception as e:
                 logger.debug(f"task cancel for {connection.device_id}: {e!r}")
+        recovery = connection.recovery
+        if recovery is not None:
+            await recovery.close()
         service = connection.openai_service
         if service is not None:
             for method in ("disconnect", "_disconnect", "cleanup"):
@@ -1086,6 +1109,7 @@ class WebSocketHandler:
         connection.runner = None
         connection.pipeline = None
         connection.openai_service = None
+        connection.recovery = None
 
     async def cleanup(self):
         """Tear down every connection at shutdown."""

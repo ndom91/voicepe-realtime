@@ -495,6 +495,15 @@ class Application:
         except Exception as e:
             logger.warning(f"⚠️ Failed to initialize Home Assistant MCP Client: {e}")
         
+        # Initialize audio recording before the handler so its pipeline can
+        # grant exactly one connection ownership of the shared file recorder.
+        self.audio_recording_service = AudioRecordingService(
+            enable_recording=enable_recording,
+            sample_rate=24000,
+            chunk_duration_seconds=30,
+            output_dir="recordings"
+        )
+
         # Initialize WebSocket handler
         self.websocket_handler = WebSocketHandler(
             host=websocket_host,
@@ -655,14 +664,6 @@ class Application:
         self.enable_web_search = enable_web_search
         self.web_search_model = web_search_model
 
-        # Initialize audio recording service (optional)
-        self.audio_recording_service = AudioRecordingService(
-            enable_recording=enable_recording,
-            sample_rate=24000,
-            chunk_duration_seconds=30,
-            output_dir="recordings"
-        )
-        
         logger.info("✅ Application initialized - ready to accept WebSocket connections")
     
     def _update_session_activity(self):
@@ -1008,23 +1009,18 @@ class Application:
 
         web_app = FastAPI(title="Voice PE Realtime backend")
 
-        async def _on_client_connected(device_id: str):
-            if self.audio_recording_service:
-                self.audio_recording_service.start_new_session(device_id)
-
         def _on_client_disconnected(connection):
             if self.session_manager:
                 self.session_manager.handle_client_disconnect(
                     connection.device_id, connection.openai_service
                 )
-            if self.audio_recording_service:
-                self.audio_recording_service.stop_recording()
 
-        @web_app.websocket("/")
-        async def device_endpoint(websocket: WebSocket):
+        @web_app.websocket("/{path:path}")
+        async def device_endpoint(websocket: WebSocket, path: str):
+            # The previous transport accepted every path. Keep that compatibility
+            # for firmware configured with a non-root WebSocket URL.
             await self.websocket_handler.serve_connection(
                 websocket,
-                on_client_connected=_on_client_connected,
                 on_client_disconnected=_on_client_disconnected,
                 activity_callback=self._update_session_activity,
             )

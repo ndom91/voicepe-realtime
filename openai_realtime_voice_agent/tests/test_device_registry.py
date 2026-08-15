@@ -63,6 +63,13 @@ async def main():
     assert reg.resolve("bedroom") is None, "unknown explicit id must NOT fall back"
     print("targeting     -> explicit id wins; default follows activity; bad id -> None")
 
+    # An idle reconnect must not take over the default target merely because it
+    # was constructed more recently.
+    reconnect = DeviceConnection("bedroom", FakeWS())
+    await reg.add(reconnect)
+    assert reg.resolve() is kitchen, "idle reconnect stole the active target"
+    await reg.remove(reconnect)
+
     # --- reconnect replaces the stale entry -------------------------------
     kitchen2 = DeviceConnection("kitchen", FakeWS())
     displaced = await reg.add(kitchen2)

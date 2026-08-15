@@ -115,7 +115,7 @@ class TimerRegistry:
 
     def set_timer(self, seconds: int, label: str, owner: str = "", device_id: str = "") -> dict:
         self._prune()
-        if len(self._timers) >= MAX_TIMERS:
+        if sum(t["device_id"] == device_id for t in self._timers.values()) >= MAX_TIMERS:
             return {"error": "too many timers running"}
         seconds = max(5, min(int(seconds), MAX_DURATION_S))
         tid = self._next_id
@@ -137,18 +137,21 @@ class TimerRegistry:
             pass
         return {"id": tid, "label": self._timers[tid]["label"], "seconds": seconds}
 
-    def cancel(self, tid: Optional[int]) -> dict:
+    def cancel(self, tid: Optional[int], device_id: str = "") -> dict:
         self._prune()
+        timers = self.list_timers(device_id)["timers"]
         if tid is None:
-            if len(self._timers) == 1:
-                tid = next(iter(self._timers))
-            elif not self._timers:
+            if len(timers) == 1:
+                tid = timers[0]["id"]
+            elif not timers:
                 return {"error": "no timers running"}
             else:
                 return {"error": "multiple timers running — need the id",
-                        "timers": self.list_timers()["timers"]}
+                        "timers": timers}
         t = self._timers.pop(int(tid), None)
-        if not t:
+        if not t or t["device_id"] != device_id:
+            if t:
+                self._timers[int(tid)] = t
             return {"error": f"no timer {tid}"}
         t["task"].cancel()
         logger.info(f"⏰ timer {tid} cancelled")
@@ -160,12 +163,13 @@ class TimerRegistry:
             pass
         return {"cancelled": tid, "label": t["label"]}
 
-    def list_timers(self) -> dict:
+    def list_timers(self, device_id: Optional[str] = None) -> dict:
         self._prune()
         now = time.monotonic()
         return {"timers": [
             {"id": tid, "label": t["label"], "seconds_left": int(t["ends"] - now)}
             for tid, t in sorted(self._timers.items())
+            if device_id is None or t["device_id"] == device_id
         ]}
 
 
@@ -204,10 +208,10 @@ def register_timer_tools(llm, registry: "TimerRegistry", device_id: str) -> None
 
     async def _cancel(params: "FunctionCallParams") -> None:
         a = params.arguments or {}
-        await params.result_callback(registry.cancel(a.get("id")))
+        await params.result_callback(registry.cancel(a.get("id"), device_id))
 
     async def _list(params: "FunctionCallParams") -> None:
-        await params.result_callback(registry.list_timers())
+        await params.result_callback(registry.list_timers(device_id))
 
     llm.register_function("set_timer", _set)
     llm.register_function("cancel_timer", _cancel)

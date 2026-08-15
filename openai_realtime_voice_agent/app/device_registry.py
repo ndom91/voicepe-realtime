@@ -89,7 +89,10 @@ class DeviceConnection:
     speaker_probe: Any = None
     turn_liveness: Any = None
     connected_at: float = field(default_factory=time.monotonic)
-    last_active: float = field(default_factory=time.monotonic)
+    # A reconnect must not become the implicit target until the user interacts
+    # with it; `connected_at` remains available for connection diagnostics.
+    last_active: float = 0.0
+    recovery: Any = None
 
     def touch(self) -> None:
         """Mark this device as the most recently used one."""

@@ -38,6 +38,16 @@ async def main():
     assert calls[0] == ("announce", "Your pasta timer is done.", "kitchen")
     assert calls[1] == ("wake", "kitchen")
     assert registry._timers == {}
+
+    # Voice tools must not expose or cancel timers from another room.
+    first = registry.set_timer(60, "tea", device_id="kitchen")
+    second = registry.set_timer(60, "coffee", device_id="office")
+    kitchen_timers = registry.list_timers("kitchen")["timers"]
+    assert len(kitchen_timers) == 1 and kitchen_timers[0]["id"] == first["id"]
+    assert registry.cancel(None, "kitchen")["cancelled"] == first["id"]
+    assert registry.cancel(second["id"], "kitchen") == {"error": f"no timer {second['id']}"}
+    assert registry.list_timers("office")["timers"][0]["id"] == second["id"]
+    registry.cancel(second["id"], "office")
     print("ALL ASSERTIONS PASSED")
 
 
