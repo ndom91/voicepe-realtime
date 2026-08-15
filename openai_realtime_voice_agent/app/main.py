@@ -31,6 +31,7 @@ from app.voice_memory import (
     get_memory_tool_definitions,
     register_memory_tools,
 )
+from app.realtime_payload import transform_live_transcribe_language
 from app.enrollment import (
     EnrollmentRecorder,
     EnrollmentConductor,
@@ -114,20 +115,7 @@ class SafeRealtimeLLMService(OpenAIRealtimeLLMService):
         gpt-live-transcribe, which instead expects `languages: [<ISO code>]`.
         """
         payload = event.model_dump(exclude_none=True)
-        transcription = (
-            payload.get("session", {})
-            .get("audio", {})
-            .get("input", {})
-            .get("transcription")
-        )
-        if (
-            payload.get("type") == "session.update"
-            and transcription
-            and transcription.get("model") == "gpt-live-transcribe"
-        ):
-            language = transcription.pop("language", None)
-            if language:
-                transcription["languages"] = [language]
+        transform_live_transcribe_language(payload)
         await self._ws_send(payload)
 
     # Per-response cost accounting (fork). The API reports exact token usage in

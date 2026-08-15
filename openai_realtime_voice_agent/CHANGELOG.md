@@ -2,6 +2,12 @@
 
 All notable changes to this add-on. Newest first.
 
+## 0.16.8 (fork)
+
+- Added selectable OpenAI transcription models, including `gpt-live-transcribe`
+  and `gpt-transcribe`. `gpt-live-transcribe` now receives its required
+  `languages` array when a transcription language is configured.
+
 ## 0.16.7 (fork)
 
 - **Wedge watchdog**: a half-open OpenAI socket (dies silently during an idle
