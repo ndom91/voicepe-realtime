@@ -263,7 +263,12 @@ configuration:
     description: >-
       The device's timer_ringing switch entity (e.g.
       switch.voice_pe_timer_ringing). Voice timers announce first, then ring
-      this if unacknowledged. Leave empty to disable ringing.
+       this if unacknowledged. Leave empty to disable ringing.
+  timer_ring_entities:
+    name: "🧩 Fork · Per-device timer ring switches"
+    description: >-
+      For one shared multi-device add-on, map each device id to its timer switch:
+      kitchen=switch.kitchen_timer_ringing,office=switch.office_timer_ringing.
   enrollment_phrase:
     name: "🧩 Fork · Enrollment wake phrase"
     description: >-

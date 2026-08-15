@@ -108,6 +108,9 @@ options:
   # Voice timers: the device's exposed "Timer ringing" switch entity; empty =
   # timers unavailable (the assistant will say so).
   timer_ring_entity: ""
+  # Per-device timer ring switches for a shared multi-device add-on, formatted
+  # as device_id=entity_id entries separated by commas.
+  timer_ring_entities: ""
   # Sensor entity prefix: sensor.voicepe_<instance_name>_* (empty = "device")
   instance_name: ""
   # Enrollment (fork): the wake phrase the audio coach asks for, and the TTS
@@ -171,6 +174,7 @@ schema:
   speaker_male_name: str
   wake_sound_entity: str
   timer_ring_entity: str
+  timer_ring_entities: str
   instance_name: str
   enrollment_phrase: str
   enrollment_tts_voice: str

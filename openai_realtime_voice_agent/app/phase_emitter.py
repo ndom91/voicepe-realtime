@@ -222,6 +222,22 @@ class PhaseEmitter(FrameProcessor):
         self._cancel_watchdog()
         self._watchdog_task = asyncio.create_task(self._thinking_watchdog())
 
+    async def close(self) -> None:
+        """Stop idle and watchdog tasks owned by this connection."""
+        tasks = (self._idle_task, self._watchdog_task)
+        self._idle_task = None
+        self._watchdog_task = None
+        for task in tasks:
+            if task is None or task is asyncio.current_task():
+                continue
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                logger.debug(f"phase task shutdown: {e!r}")
+
     async def _emit_idle_after_debounce(self) -> None:
         try:
             await asyncio.sleep(self._idle_debounce_s)

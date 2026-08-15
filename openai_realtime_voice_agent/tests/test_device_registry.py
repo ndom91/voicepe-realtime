@@ -52,6 +52,7 @@ async def main():
     await reg.add(office)
     assert len(reg) == 2
     assert reg.ids() == ["kitchen", "office"]
+    assert reg.resolve() is None, "idle devices must not receive implicit sends"
 
     kitchen.touch()
     await asyncio.sleep(0.01)
@@ -61,7 +62,7 @@ async def main():
     assert reg.resolve() is kitchen, "activity moves the default target"
     assert reg.resolve("office") is office, "explicit id wins"
     assert reg.resolve("bedroom") is None, "unknown explicit id must NOT fall back"
-    print("targeting     -> explicit id wins; default follows activity; bad id -> None")
+    print("targeting     -> explicit id wins; default follows activity; idle -> None")
 
     # An idle reconnect must not take over the default target merely because it
     # was constructed more recently.

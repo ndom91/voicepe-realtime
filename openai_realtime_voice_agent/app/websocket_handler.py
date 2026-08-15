@@ -194,6 +194,7 @@ class ConnectionRecovery(FrameProcessor):
         # mic during an active turn or the follow-up window).
         self._last_input_audio = time.monotonic()
         self._refresh_task = None
+        self._recover_task = None
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
@@ -230,7 +231,7 @@ class ConnectionRecovery(FrameProcessor):
                 if now - self._last_attempt >= self.RECONNECT_COOLDOWN_S:
                     self._reconnecting = True
                     self._last_attempt = now
-                    asyncio.create_task(self._recover(msg))
+                    self._recover_task = asyncio.create_task(self._recover(msg))
             else:
                 # Non-connection-death error that ENDS a turn without a reply:
                 # most importantly an OpenAI rate-limit ("Rate limit reached …"),
@@ -321,17 +322,19 @@ class ConnectionRecovery(FrameProcessor):
 
     async def close(self) -> None:
         """Stop background work owned by this pipeline processor."""
-        task = self._refresh_task
+        tasks = (self._refresh_task, self._recover_task)
         self._refresh_task = None
-        if task is None:
-            return
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
-        except Exception as e:
-            logger.debug(f"proactive refresh task shutdown: {e!r}")
+        self._recover_task = None
+        for task in tasks:
+            if task is None or task is asyncio.current_task():
+                continue
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                logger.debug(f"connection recovery task shutdown: {e!r}")
 
     async def _go_idle(self, reason: str) -> None:
         """Put the device in idle for a dead turn — via PhaseEmitter when wired."""
@@ -490,10 +493,11 @@ class WebSocketHandler:
         phase_emitter = PhaseEmitter(
             send_phase=send_phase, liveness=connection.turn_liveness
         )
+        connection.phase_emitter = phase_emitter
 
         connection.recovery = ConnectionRecovery(
             openai_service=openai_service, emit_idle=send_phase,
-            phase_emitter=phase_emitter,
+            phase_emitter=connection.phase_emitter,
         )
         pipeline_components = [
             transport.input(),
@@ -510,10 +514,10 @@ class WebSocketHandler:
         # devices share it would interleave their audio into unusable
         # recordings. Exactly one connection owns it at a time — see
         # _claim_recording.
-        records_audio = self._claim_recording(client_id)
+        connection.records_audio = self._claim_recording(client_id)
         input_recorder = (
             self.audio_recording_service.get_input_recorder()
-            if (self.audio_recording_service and records_audio) else None
+            if (self.audio_recording_service and connection.records_audio) else None
         )
         if input_recorder:
             pipeline_components.append(input_recorder)
@@ -546,12 +550,12 @@ class WebSocketHandler:
         # downstream. Placed before transport.output() so it sees both the
         # user (UserStarted/Stopped) and bot (BotStarted/Stopped) frames.
         # (Constructed above, before ConnectionRecovery.)
-        pipeline_components.append(phase_emitter)
+        pipeline_components.append(connection.phase_emitter)
 
         # Add output audio recorder to capture ONLY OutputAudioRawFrame
         output_recorder = (
             self.audio_recording_service.get_output_recorder()
-            if (self.audio_recording_service and records_audio) else None
+            if (self.audio_recording_service and connection.records_audio) else None
         )
         if output_recorder:
             pipeline_components.append(output_recorder)
@@ -1026,6 +1030,7 @@ class WebSocketHandler:
         serializer.set_activity_handler(connection.touch)
 
         displaced = None
+        registered = False
         try:
             if self.openai_service_factory is None:
                 raise RuntimeError("openai_service_factory must be set before serving connections")
@@ -1044,6 +1049,7 @@ class WebSocketHandler:
                 await task.cancel()
 
             displaced = await self.devices.add(connection)
+            registered = True
             await connection.send_json(self.hello_payload())
 
             if displaced is not None:
@@ -1072,6 +1078,8 @@ class WebSocketHandler:
                     and self.enrollment_conductor.device_id == device_id
                 ):
                     await self.enrollment_conductor.stop()
+            elif not registered and connection.records_audio:
+                self._release_recording(device_id)
             if removed and on_client_disconnected:
                 try:
                     on_client_disconnected(connection)
@@ -1094,6 +1102,9 @@ class WebSocketHandler:
         recovery = connection.recovery
         if recovery is not None:
             await recovery.close()
+        phase_emitter = connection.phase_emitter
+        if phase_emitter is not None:
+            await phase_emitter.close()
         service = connection.openai_service
         if service is not None:
             for method in ("disconnect", "_disconnect", "cleanup"):
@@ -1110,6 +1121,7 @@ class WebSocketHandler:
         connection.pipeline = None
         connection.openai_service = None
         connection.recovery = None
+        connection.phase_emitter = None
 
     async def cleanup(self):
         """Tear down every connection at shutdown."""

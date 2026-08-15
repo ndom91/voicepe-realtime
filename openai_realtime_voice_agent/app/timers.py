@@ -31,8 +31,17 @@ RING_AUTO_OFF_S = 120  # stop ringing after 2 min if nobody silences it
 ANNOUNCE_GRACE_S = 20  # spoken announcement first; ring only if unacknowledged
 
 
-async def _set_ring(on: bool) -> bool:
-    entity = os.environ.get("TIMER_RING_ENTITY", "").strip()
+def _ring_entity(device_id: str) -> str:
+    mappings = os.environ.get("TIMER_RING_ENTITIES", "")
+    for mapping in mappings.split(","):
+        key, separator, entity = mapping.partition("=")
+        if separator and key.strip() == device_id:
+            return entity.strip()
+    return os.environ.get("TIMER_RING_ENTITY", "").strip()
+
+
+async def _set_ring(on: bool, device_id: str = "") -> bool:
+    entity = _ring_entity(device_id)
     token = os.environ.get("SUPERVISOR_TOKEN", "")
     if not entity or not token:
         return False
@@ -108,9 +117,9 @@ class TimerRegistry:
                 return
         # 3. The gentle bell (auto-off backstop unchanged).
         logger.info(f"⏰ timer {tid} escalating to ring")
-        if await _set_ring(True):
+        if await _set_ring(True, t["device_id"]):
             await asyncio.sleep(RING_AUTO_OFF_S)
-            await _set_ring(False)
+            await _set_ring(False, t["device_id"])
         self._timers.pop(tid, None)
 
     def set_timer(self, seconds: int, label: str, owner: str = "", device_id: str = "") -> dict:
@@ -148,11 +157,10 @@ class TimerRegistry:
             else:
                 return {"error": "multiple timers running — need the id",
                         "timers": timers}
-        t = self._timers.pop(int(tid), None)
+        t = self._timers.get(int(tid))
         if not t or t["device_id"] != device_id:
-            if t:
-                self._timers[int(tid)] = t
             return {"error": f"no timer {tid}"}
+        del self._timers[int(tid)]
         t["task"].cancel()
         logger.info(f"⏰ timer {tid} cancelled")
         try:

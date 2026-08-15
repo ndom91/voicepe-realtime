@@ -93,6 +93,8 @@ class DeviceConnection:
     # with it; `connected_at` remains available for connection diagnostics.
     last_active: float = 0.0
     recovery: Any = None
+    phase_emitter: Any = None
+    records_audio: bool = False
 
     def touch(self) -> None:
         """Mark this device as the most recently used one."""
@@ -220,7 +222,8 @@ class DeviceRegistry:
             return self._devices.get(sanitize_device_id(device_id))
         if not self._devices:
             return None
-        return max(self._devices.values(), key=lambda c: c.last_active)
+        connection = max(self._devices.values(), key=lambda c: c.last_active)
+        return connection if connection.last_active > 0 else None
 
     def ids(self) -> list[str]:
         """The ids of every connected device, for tool descriptions and logs."""

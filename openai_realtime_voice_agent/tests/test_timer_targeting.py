@@ -1,5 +1,6 @@
 """Verify timer expiry stays scoped to the device that created it."""
 import asyncio
+import os
 from pathlib import Path
 import sys
 import time
@@ -11,6 +12,13 @@ from app.timers import TimerRegistry
 
 
 async def main():
+    os.environ["TIMER_RING_ENTITY"] = "switch.legacy_timer"
+    os.environ["TIMER_RING_ENTITIES"] = (
+        "kitchen=switch.kitchen_timer,office=switch.office_timer"
+    )
+    assert timers._ring_entity("office") == "switch.office_timer"
+    assert timers._ring_entity("bedroom") == "switch.legacy_timer"
+
     timers.ANNOUNCE_GRACE_S = 0
     registry = TimerRegistry()
     calls = []
@@ -31,6 +39,7 @@ async def main():
         "label": "pasta",
         "ends": time.monotonic(),
         "wall": time.time(),
+        "task": asyncio.current_task(),
     }
 
     await registry._fire(1)
@@ -48,6 +57,24 @@ async def main():
     assert registry.cancel(second["id"], "kitchen") == {"error": f"no timer {second['id']}"}
     assert registry.list_timers("office")["timers"][0]["id"] == second["id"]
     registry.cancel(second["id"], "office")
+
+    # A multi-device install must ring the timer's own device switch.
+    ring_calls = []
+
+    async def set_ring(on, device_id):
+        ring_calls.append((on, device_id))
+        return True
+
+    timers._set_ring = set_ring
+    timers.RING_AUTO_OFF_S = 0
+    registry._timers[3] = {
+        "owner": "", "device_id": "office", "label": "tea",
+        "ends": time.monotonic(), "wall": time.time(), "task": asyncio.current_task(),
+    }
+    registry.announcer = None
+    await registry._fire(3)
+    assert ring_calls == [(True, "office"), (False, "office")]
+    print("ring targeting -> timer ring stays in its originating room")
     print("ALL ASSERTIONS PASSED")
 
 
