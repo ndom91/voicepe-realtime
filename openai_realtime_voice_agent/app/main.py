@@ -161,12 +161,16 @@ class SafeRealtimeLLMService(OpenAIRealtimeLLMService):
         ourselves on reconnect. The live context is untouched (it's restored by the
         SessionManager on the next real turn).
         """
-        await super().reset_conversation()
+        self._resetting_conversation = True
         try:
-            self._run_llm_when_api_session_ready = False
-            self._llm_needs_conversation_setup = False
-        except Exception as e:  # pragma: no cover - defensive
-            logger.warning(f"⚠️ could not clear post-reconnect response flags: {e!r}")
+            await super().reset_conversation()
+            try:
+                self._run_llm_when_api_session_ready = False
+                self._llm_needs_conversation_setup = False
+            except Exception as e:  # pragma: no cover - defensive
+                logger.warning(f"⚠️ could not clear post-reconnect response flags: {e!r}")
+        finally:
+            self._resetting_conversation = False
 
     # Error codes that must NOT kill the realtime session. pipecat 0.0.97's
     # _receive_task_handler does `_handle_evt_error(evt); return` on EVERY
@@ -281,6 +285,11 @@ class SafeRealtimeLLMService(OpenAIRealtimeLLMService):
             raise  # our own disconnect/reset tearing the task down — not a death
         except Exception as e:
             await self.push_error(error_msg=f"realtime receive loop died: {e!r}")
+            return
+        # reset_conversation() intentionally closes the old reader before
+        # connecting the replacement session. That normal close is not a
+        # recoverable failure and may arrive after the processor has stopped.
+        if getattr(self, "_resetting_conversation", False):
             return
         # Loop ended without an exception: a clean server-side close, or the
         # fatal-error path (which already pushed its own ErrorFrame —

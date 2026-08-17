@@ -2,12 +2,15 @@
 import asyncio
 from pathlib import Path
 import sys
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.device_registry import DeviceConnection
+from app.main import SafeRealtimeLLMService
 from app.phase_emitter import PhaseEmitter
 from app.websocket_handler import ConnectionRecovery, WebSocketHandler
+from pipecat.services.openai.realtime.llm import OpenAIRealtimeLLMService
 
 
 async def main():
@@ -67,6 +70,23 @@ async def main():
         pass
     else:
         raise AssertionError("wedge recovery survived connection teardown")
+
+    # reset_conversation deliberately closes the old receive task. That must
+    # not emit a second connection-death ErrorFrame into a stopped processor.
+    service = object.__new__(SafeRealtimeLLMService)
+    service._resetting_conversation = True
+    errors = []
+
+    async def receive_ended(_service):
+        return None
+
+    async def push_error(**kwargs):
+        errors.append(kwargs)
+
+    service.push_error = push_error
+    with patch.object(OpenAIRealtimeLLMService, "_receive_task_handler", receive_ended):
+        await service._receive_task_handler()
+    assert errors == []
     print("ALL ASSERTIONS PASSED")
 
 
