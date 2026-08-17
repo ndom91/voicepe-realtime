@@ -1051,10 +1051,17 @@ class WebSocketHandler:
             connection.task = task
 
             @connection.transport.event_handler("on_client_disconnected")
-            async def _stop_disconnected_task(_websocket):
+            async def _stop_disconnected_task(_transport, _websocket):
                 # Pipecat's FastAPI input transport signals this event but does
                 # not stop PipelineRunner itself. Cancel only this device's task
                 # so serve_connection reaches its per-device cleanup.
+                #
+                # Pipecat invokes handlers as handler(emitter, *event_args), so
+                # this takes the transport as well as the websocket. Getting the
+                # arity wrong raises before the cancel, leaving the old pipeline
+                # running: its recorder then pushes into torn-down processors
+                # ("no attribute _FrameProcessor__input_queue") until
+                # push_error_frame recurses past the stack limit.
                 await task.cancel()
 
             displaced = await self.devices.add(connection)
