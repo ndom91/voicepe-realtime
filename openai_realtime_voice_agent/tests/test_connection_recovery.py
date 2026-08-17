@@ -30,6 +30,21 @@ async def main():
     assert phase_task.cancelled()
     assert connection.recovery is None
     assert connection.phase_emitter is None
+
+    class FakeRecovery:
+        def __init__(self):
+            self.reasons = []
+
+        async def force_reconnect(self, reason):
+            self.reasons.append(reason)
+
+    handler = WebSocketHandler()
+    handler.WEDGE_TIMEOUT_S = 0
+    wedge_recovery = FakeRecovery()
+    wedge_connection = DeviceConnection("kitchen", object(), recovery=wedge_recovery)
+    wedge_phase = PhaseEmitter(None)
+    await handler._wedge_check(wedge_connection, wedge_phase, 1.0)
+    assert wedge_recovery.reasons == ["wedge: silent after wake"]
     print("ALL ASSERTIONS PASSED")
 
 
