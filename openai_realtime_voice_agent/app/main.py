@@ -627,6 +627,10 @@ class Application:
             )
 
         self.timer_registry.last_wake = _last_wake
+        self.timer_registry.allow_legacy_ring = lambda device_id: (
+            len(self.websocket_handler.devices) == 1
+            and self.websocket_handler.resolve_device(device_id) is not None
+        )
 
         # Announce endpoint (fork): a LAN route back to the device so the
         # household's agent can speak results of long-running work. Reuses the

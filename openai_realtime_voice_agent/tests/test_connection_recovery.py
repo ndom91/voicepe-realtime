@@ -45,6 +45,28 @@ async def main():
     wedge_phase = PhaseEmitter(None)
     await handler._wedge_check(wedge_connection, wedge_phase, 1.0)
     assert wedge_recovery.reasons == ["wedge: silent after wake"]
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    class BlockingService:
+        async def reset_conversation(self):
+            started.set()
+            await release.wait()
+
+    live_recovery = ConnectionRecovery(BlockingService())
+    live_connection = DeviceConnection("office", object(), recovery=live_recovery)
+    wedge_task = asyncio.create_task(
+        handler._wedge_check(live_connection, PhaseEmitter(None), 1.0)
+    )
+    await started.wait()
+    await handler._teardown(live_connection)
+    try:
+        await wedge_task
+    except asyncio.CancelledError:
+        pass
+    else:
+        raise AssertionError("wedge recovery survived connection teardown")
     print("ALL ASSERTIONS PASSED")
 
 

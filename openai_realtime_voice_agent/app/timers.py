@@ -31,17 +31,17 @@ RING_AUTO_OFF_S = 120  # stop ringing after 2 min if nobody silences it
 ANNOUNCE_GRACE_S = 20  # spoken announcement first; ring only if unacknowledged
 
 
-def _ring_entity(device_id: str) -> str:
+def _ring_entity(device_id: str, allow_legacy: bool = True) -> str:
     mappings = os.environ.get("TIMER_RING_ENTITIES", "")
     for mapping in mappings.split(","):
         key, separator, entity = mapping.partition("=")
         if separator and key.strip() == device_id:
             return entity.strip()
-    return os.environ.get("TIMER_RING_ENTITY", "").strip()
+    return os.environ.get("TIMER_RING_ENTITY", "").strip() if allow_legacy else ""
 
 
-async def _set_ring(on: bool, device_id: str = "") -> bool:
-    entity = _ring_entity(device_id)
+async def _set_ring(on: bool, device_id: str = "", allow_legacy: bool = True) -> bool:
+    entity = _ring_entity(device_id, allow_legacy)
     token = os.environ.get("SUPERVISOR_TOKEN", "")
     if not entity or not token:
         return False
@@ -68,6 +68,7 @@ class TimerRegistry:
         self.announcer = None
         self.get_owner = None
         self.last_wake = None
+        self.allow_legacy_ring = None
 
     def _prune(self):
         now = time.monotonic()
@@ -117,9 +118,13 @@ class TimerRegistry:
                 return
         # 3. The gentle bell (auto-off backstop unchanged).
         logger.info(f"⏰ timer {tid} escalating to ring")
-        if await _set_ring(True, t["device_id"]):
+        allow_legacy = (
+            self.allow_legacy_ring(t["device_id"])
+            if self.allow_legacy_ring is not None else True
+        )
+        if await _set_ring(True, t["device_id"], allow_legacy):
             await asyncio.sleep(RING_AUTO_OFF_S)
-            await _set_ring(False, t["device_id"])
+            await _set_ring(False, t["device_id"], allow_legacy)
         self._timers.pop(tid, None)
 
     def set_timer(self, seconds: int, label: str, owner: str = "", device_id: str = "") -> dict:

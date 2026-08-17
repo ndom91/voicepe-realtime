@@ -18,6 +18,7 @@ async def main():
     )
     assert timers._ring_entity("office") == "switch.office_timer"
     assert timers._ring_entity("bedroom") == "switch.legacy_timer"
+    assert timers._ring_entity("bedroom", allow_legacy=False) == ""
 
     timers.ANNOUNCE_GRACE_S = 0
     registry = TimerRegistry()
@@ -61,7 +62,9 @@ async def main():
     # A multi-device install must ring the timer's own device switch.
     ring_calls = []
 
-    async def set_ring(on, device_id):
+    async def set_ring(on, device_id, allow_legacy=True):
+        if not allow_legacy:
+            return False
         ring_calls.append((on, device_id))
         return True
 
@@ -75,6 +78,15 @@ async def main():
     await registry._fire(3)
     assert ring_calls == [(True, "office"), (False, "office")]
     print("ring targeting -> timer ring stays in its originating room")
+
+    registry.allow_legacy_ring = lambda _device_id: False
+    registry._timers[4] = {
+        "owner": "", "device_id": "bedroom", "label": "bread",
+        "ends": time.monotonic(), "wall": time.time(), "task": asyncio.current_task(),
+    }
+    await registry._fire(4)
+    assert ring_calls == [(True, "office"), (False, "office")]
+    print("ring fallback  -> legacy switch is disabled with multiple devices")
     print("ALL ASSERTIONS PASSED")
 
 

@@ -195,6 +195,7 @@ class ConnectionRecovery(FrameProcessor):
         self._last_input_audio = time.monotonic()
         self._refresh_task = None
         self._recover_task = None
+        self._closed = False
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
@@ -253,11 +254,12 @@ class ConnectionRecovery(FrameProcessor):
         (observed live 2026-07-16: wake + speech after an idle gap → zero
         server events, no error, request lost)."""
         now = time.monotonic()
-        if self._reconnecting or now - self._last_attempt < self.RECONNECT_COOLDOWN_S:
+        if self._closed or self._reconnecting or now - self._last_attempt < self.RECONNECT_COOLDOWN_S:
             return
         self._reconnecting = True
         self._last_attempt = now
-        await self._recover(reason)
+        self._recover_task = asyncio.create_task(self._recover(reason))
+        await self._recover_task
 
     async def _recover(self, reason: str):
         t0 = time.monotonic()
@@ -322,6 +324,7 @@ class ConnectionRecovery(FrameProcessor):
 
     async def close(self) -> None:
         """Stop background work owned by this pipeline processor."""
+        self._closed = True
         tasks = (self._refresh_task, self._recover_task)
         self._refresh_task = None
         self._recover_task = None
