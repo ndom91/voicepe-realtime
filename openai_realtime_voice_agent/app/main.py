@@ -31,7 +31,7 @@ from app.voice_memory import (
     get_memory_tool_definitions,
     register_memory_tools,
 )
-from app.realtime_payload import transform_live_transcribe_language
+from app.realtime_payload import transform_gpt_transcription_language
 from app.enrollment import (
     EnrollmentRecorder,
     EnrollmentConductor,
@@ -108,14 +108,14 @@ class SafeRealtimeLLMService(OpenAIRealtimeLLMService):
         return
 
     async def send_client_event(self, event):  # type: ignore[override]
-        """Serialize gpt-live-transcribe with its required `languages` field.
+        """Serialize GPT transcription models with their required `languages` field.
 
         Pipecat 0.0.97 only exposes the legacy singular `language` field on
-        InputAudioTranscription. OpenAI rejects that field for
-        gpt-live-transcribe, which instead expects `languages: [<ISO code>]`.
+        InputAudioTranscription. OpenAI rejects that field for newer GPT
+        transcription models, which instead expect `languages: [<ISO code>]`.
         """
         payload = event.model_dump(exclude_none=True)
-        transform_live_transcribe_language(payload)
+        transform_gpt_transcription_language(payload)
         await self._ws_send(payload)
 
     # Per-response cost accounting (fork). The API reports exact token usage in
