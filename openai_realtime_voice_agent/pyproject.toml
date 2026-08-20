@@ -11,7 +11,8 @@ python = ">=3.11,<3.14"
 # (FrameSerializerType, OpenAIRealtimeLLMService, SessionProperties events,
 # WebsocketServerParams). Without a lockfile pip otherwise resolves Pipecat
 # 1.x, whose changed API breaks the imports. 0.0.97 is the version this was
-# developed/tested against.
+# developed/tested against. On any Pipecat upgrade, verify the custom mixed
+# transport against its websocket client, callbacks, and input/output internals.
 pipecat-ai = {extras = ["mcp", "openai", "websocket"], version = "0.0.97"}
 python-dotenv = ">=1.0.0"
 # Voice-print speaker ID (fork): ONNX speaker-embedding runtime. Ships

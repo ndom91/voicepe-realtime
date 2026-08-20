@@ -4,12 +4,12 @@ import json
 import logging
 import time
 import uuid
-from typing import Optional, Callable, Awaitable, Dict
+from typing import Any, Optional, Callable, Awaitable, Dict
 
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineTask
-from pipecat.transports.websocket.server import WebsocketServerTransport, WebsocketServerParams
+from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams
 from pipecat.services.openai.realtime.llm import OpenAIRealtimeLLMService
 
 from pipecat.processors.frame_processor import FrameProcessor, FrameDirection
@@ -17,6 +17,8 @@ from pipecat.frames.frames import Frame, InputAudioRawFrame, OutputAudioRawFrame
 from pipecat.audio.utils import create_stream_resampler
 from pipecat.services.openai.realtime import events as openai_rt_events
 
+from app.device_registry import DeviceConnection, DeviceRegistry, device_id_from_websocket
+from app.multi_client_transport import MixedFastAPIWebsocketTransport
 from app.raw_audio_serializer import RawAudioSerializer
 from app.session_manager import SessionManager
 from app.audio_recording_service import AudioRecordingService
@@ -172,7 +174,7 @@ class ConnectionRecovery(FrameProcessor):
     def __init__(self, openai_service, emit_idle=None, phase_emitter=None, **kwargs):
         super().__init__(**kwargs)
         self._service = openai_service
-        self._emit_idle = emit_idle  # async callable(value:str), e.g. broadcast_phase
+        self._emit_idle = emit_idle  # async callable(value:str), this device's send_phase
         # Preferred idle route: PhaseEmitter.force_idle() keeps the emitter's
         # phase state consistent AND suppresses the racing `thinking` from VAD
         # stop events still in flight (observed: a raw broadcast idle was
@@ -192,6 +194,8 @@ class ConnectionRecovery(FrameProcessor):
         # mic during an active turn or the follow-up window).
         self._last_input_audio = time.monotonic()
         self._refresh_task = None
+        self._recover_task = None
+        self._closed = False
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
@@ -228,7 +232,7 @@ class ConnectionRecovery(FrameProcessor):
                 if now - self._last_attempt >= self.RECONNECT_COOLDOWN_S:
                     self._reconnecting = True
                     self._last_attempt = now
-                    asyncio.create_task(self._recover(msg))
+                    self._recover_task = asyncio.create_task(self._recover(msg))
             else:
                 # Non-connection-death error that ENDS a turn without a reply:
                 # most importantly an OpenAI rate-limit ("Rate limit reached …"),
@@ -250,11 +254,12 @@ class ConnectionRecovery(FrameProcessor):
         (observed live 2026-07-16: wake + speech after an idle gap → zero
         server events, no error, request lost)."""
         now = time.monotonic()
-        if self._reconnecting or now - self._last_attempt < self.RECONNECT_COOLDOWN_S:
+        if self._closed or self._reconnecting or now - self._last_attempt < self.RECONNECT_COOLDOWN_S:
             return
         self._reconnecting = True
         self._last_attempt = now
-        await self._recover(reason)
+        self._recover_task = asyncio.create_task(self._recover(reason))
+        await self._recover_task
 
     async def _recover(self, reason: str):
         t0 = time.monotonic()
@@ -317,6 +322,23 @@ class ConnectionRecovery(FrameProcessor):
             except Exception as e:
                 logger.warning(f"⚠️ proactive refresh loop error: {e!r}")
 
+    async def close(self) -> None:
+        """Stop background work owned by this pipeline processor."""
+        self._closed = True
+        tasks = (self._refresh_task, self._recover_task)
+        self._refresh_task = None
+        self._recover_task = None
+        for task in tasks:
+            if task is None or task is asyncio.current_task():
+                continue
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                logger.debug(f"connection recovery task shutdown: {e!r}")
+
     async def _go_idle(self, reason: str) -> None:
         """Put the device in idle for a dead turn — via PhaseEmitter when wired."""
         if self._phase_emitter is not None:
@@ -339,6 +361,8 @@ class ConnectionRecovery(FrameProcessor):
 
 class WebSocketHandler:
     """Handles WebSocket transport initialization, pipeline building, and event management."""
+
+    WEDGE_TIMEOUT_S = 12.0
     
     def __init__(
         self,
@@ -378,76 +402,69 @@ class WebSocketHandler:
         self.wake_open_delay_ms = max(0, int(wake_open_delay_ms))
         self.playback_prebuffer_ms = max(0, int(playback_prebuffer_ms))
 
-        self.transport: Optional[WebsocketServerTransport] = None
-        self.pipeline: Optional[Pipeline] = None
-        self.runner: Optional[PipelineRunner] = None
-        self.current_task: Optional[PipelineTask] = None
-        # The serializer instance the transport reads through. Kept so
-        # build_pipeline can wire its device-interrupt callback to the OpenAI
-        # service.
-        self._serializer: Optional[RawAudioSerializer] = None
-        # Connected device websockets, used to push va_client control/phase
-        # messages as TEXT frames (the audio path uses the binary serializer).
-        self._websockets: set = set()
-        # Speaker context v1 (fork): set by main.py when speaker names are
-        # configured; wired to the serializer + OpenAI service in build_pipeline.
-        self.speaker_probe = None
-        # Voice enrollment recorder (fork): set by main.py; the serializer feeds
-        # it every inbound mic frame while an enrollment session is active.
+        # Per-device connections. Everything that used to be a singleton here —
+        # transport, serializer, OpenAI session, pipeline, task — now lives on a
+        # DeviceConnection, because sharing one of each is precisely what forced
+        # a second device to displace the first.
+        self.devices = DeviceRegistry()
+        # Builds a fresh OpenAI service for a connection. Set by main.py, which
+        # owns the model/tool configuration. Takes the DeviceConnection so
+        # per-device tools (e.g. disconnect_client) can bind to that device's
+        # transport rather than to a process-wide one.
+        self.openai_service_factory: Optional[Callable[[DeviceConnection], Awaitable[Any]]] = None
+        # Which device's audio the (single-file) recorder is following.
+        self._recording_owner: Optional[str] = None
+        # Voice enrollment remains single-user, but is explicitly targeted to
+        # the connection that starts it.
         self.enrollment_recorder = None
         self.enrollment_conductor = None
     
-    def create_transport(self) -> WebsocketServerTransport:
-        """
-        Create and initialize WebSocket transport.
-        
-        Returns:
-            WebsocketServerTransport instance
-        """
-        logger.info("Initializing WebSocket transport...")
-        
-        # Use RawAudioSerializer for binary PCM audio. It tags incoming frames
-        # with the device mic rate (16 kHz for Voice PE); the transport
-        # resamples in/out to the 24 kHz pipeline rate below.
-        serializer = RawAudioSerializer()
-        self._serializer = serializer
+    def create_transport(
+        self, websocket, serializer: RawAudioSerializer
+    ) -> MixedFastAPIWebsocketTransport:
+        """Create a transport for one accepted connection.
 
-        # Create WebsocketServerTransport with WebsocketServerParams
-        # The transport will start its own server automatically
-        self.transport = WebsocketServerTransport(
-            host=self.host,
-            port=self.port,
-            params=WebsocketServerParams(
+        Args:
+            websocket: The accepted FastAPI/starlette WebSocket.
+            serializer: This connection's serializer.
+
+        Returns:
+            A transport bound to that one connection.
+        """
+        return MixedFastAPIWebsocketTransport(
+            websocket=websocket,
+            params=FastAPIWebsocketParams(
                 serializer=serializer,
                 audio_in_enabled=True,
                 audio_out_enabled=True,
                 audio_in_sample_rate=PIPELINE_SAMPLE_RATE,
                 audio_out_sample_rate=PIPELINE_SAMPLE_RATE,
-            )
+            ),
         )
-        
-        logger.info(f"✅ WebSocket transport created - will listen on ws://{self.host}:{self.port}/")
-        return self.transport
-    
+
+
     def build_pipeline(
         self,
-        transport: WebsocketServerTransport,
-        openai_service: OpenAIRealtimeLLMService,
-        client_id: str,
+        connection: DeviceConnection,
         activity_callback: Optional[Callable[[], None]] = None
     ) -> tuple[Pipeline, PipelineRunner, PipelineTask]:
-        """
-        Build pipeline for a WebSocket transport connection.
-        
+        """Build the pipeline from one connection's resources.
+
         Args:
-            transport: The WebSocket transport instance
-            openai_service: The OpenAI service instance
-            client_id: Unique identifier for the client device
+            connection: The device's connection, with its transport,
+                serializer and OpenAI service already set.
             activity_callback: Optional callback for session activity tracking
-            
+
         Returns:
             Tuple of (Pipeline, PipelineRunner, PipelineTask)
         """
+        transport = connection.transport
+        openai_service = connection.openai_service
+        client_id = connection.device_id
+        serializer = connection.serializer
+        # Phases go to this device only. They used to be broadcast, so one
+        # room's listening/thinking/replying drove every device's LEDs.
+        send_phase = connection.send_phase
         logger.info(f"🔗 Building pipeline for client: {client_id}")
         
         if openai_service is None:
@@ -478,22 +495,35 @@ class WebSocketHandler:
         # idle through PhaseEmitter.force_idle() (consistent phase state +
         # racing-`thinking` suppression); it is APPENDED near the end of the
         # pipeline below, before transport.output().
-        phase_emitter = PhaseEmitter(send_phase=self.broadcast_phase)
+        phase_emitter = PhaseEmitter(
+            send_phase=send_phase, liveness=connection.turn_liveness
+        )
+        connection.phase_emitter = phase_emitter
 
+        connection.recovery = ConnectionRecovery(
+            openai_service=openai_service, emit_idle=send_phase,
+            phase_emitter=connection.phase_emitter,
+        )
         pipeline_components = [
             transport.input(),
             # Watch for OpenAI connection-death ErrorFrames (they travel upstream
             # to the task source, so place this upstream of the service) and
             # reconnect in place. Without it a 1011/1001 drop bricks the session.
-            (connection_recovery := ConnectionRecovery(
-                openai_service=openai_service, emit_idle=self.broadcast_phase,
-                phase_emitter=phase_emitter)),
+            connection.recovery,
             InputResampler(out_rate=PIPELINE_SAMPLE_RATE),
             input_activity_tracker,
         ]
         
-        # Add input audio recorder to capture ONLY InputAudioRawFrame
-        input_recorder = self.audio_recording_service.get_input_recorder() if self.audio_recording_service else None
+        # Add input audio recorder to capture ONLY InputAudioRawFrame.
+        # AudioRecordingService writes ONE session file, so letting several
+        # devices share it would interleave their audio into unusable
+        # recordings. Exactly one connection owns it at a time — see
+        # _claim_recording.
+        connection.records_audio = self._claim_recording(client_id)
+        input_recorder = (
+            self.audio_recording_service.get_input_recorder()
+            if (self.audio_recording_service and connection.records_audio) else None
+        )
         if input_recorder:
             pipeline_components.append(input_recorder)
         
@@ -525,10 +555,13 @@ class WebSocketHandler:
         # downstream. Placed before transport.output() so it sees both the
         # user (UserStarted/Stopped) and bot (BotStarted/Stopped) frames.
         # (Constructed above, before ConnectionRecovery.)
-        pipeline_components.append(phase_emitter)
+        pipeline_components.append(connection.phase_emitter)
 
         # Add output audio recorder to capture ONLY OutputAudioRawFrame
-        output_recorder = self.audio_recording_service.get_output_recorder() if self.audio_recording_service else None
+        output_recorder = (
+            self.audio_recording_service.get_output_recorder()
+            if (self.audio_recording_service and connection.records_audio) else None
+        )
         if output_recorder:
             pipeline_components.append(output_recorder)
 
@@ -547,13 +580,15 @@ class WebSocketHandler:
         
         # Create pipeline runner and task
         # Disable idle timeout - server should always stay ready for connections
-        runner = PipelineRunner()
+        # handle_sigint=False is REQUIRED now that there is a runner per
+        # connection: PipelineRunner installs a process-wide SIGINT handler by
+        # default, so each new device would clobber the previous one's and a
+        # disconnect would tear down shutdown handling for the whole add-on.
+        # The process owns its own signal handling in main().
+        runner = PipelineRunner(handle_sigint=False)
         task = PipelineTask(pipeline, idle_timeout_secs=None, cancel_on_idle_timeout=False)
-        
-        # Start pipeline in background
-        asyncio.create_task(runner.run(task))
-        logger.info("✅ Pipeline started for WebSocket connection")
-        logger.info("✅ Pipeline initialized successfully")
+
+        logger.info(f"✅ Pipeline built for {client_id}")
 
         # Wire the device "stop" interrupt. The serializer calls this when it
         # sees {"type":"interrupt"} from the device.
@@ -692,22 +727,10 @@ class WebSocketHandler:
             except Exception as e:
                 logger.debug(f"🧽 mic-flush input clear no-op ({e!r})")
 
-        WEDGE_TIMEOUT_S = 12.0
-
-        async def _wedge_check(wake_mono: float):
-            # If the server VAD shows no life this long after a wake, the
-            # OpenAI socket is presumed half-open (dead) → reconnect in place.
-            # False positive = a silent wake (user said nothing): the reconnect
-            # is 3s during idle, harmless. Cooldown lives in force_reconnect.
-            await asyncio.sleep(WEDGE_TIMEOUT_S)
-            if getattr(phase_emitter, "last_vad_mono", 0.0) < wake_mono:
-                logger.warning(
-                    "🧟 no server VAD activity %.0fs after wake — presuming a "
-                    "half-open OpenAI socket, reconnecting", WEDGE_TIMEOUT_S)
-                await connection_recovery.force_reconnect("wedge: silent after wake")
-
         async def _on_device_wake():
-            asyncio.create_task(_wedge_check(time.monotonic()))
+            asyncio.create_task(
+                self._wedge_check(connection, phase_emitter, time.monotonic())
+            )
             # va_client sends {"type":"wake"} on every wake (start_session). Mark
             # the turn boundary for the dangling-VAD guard (A): until the user
             # actually speaks, a server-VAD end-of-turn is a stale pre-wake
@@ -735,11 +758,11 @@ class WebSocketHandler:
             on_real_speech=_clear_kill_window,
         )
 
-        if self._serializer is not None:
-            self._serializer.set_interrupt_handler(_on_device_interrupt)
-            self._serializer.set_session_start_handler(_on_device_session_start)
-            self._serializer.set_mic_flush_handler(_on_device_mic_flush)
-            self._serializer.set_wake_handler(_on_device_wake)
+        if serializer is not None:
+            serializer.set_interrupt_handler(_on_device_interrupt)
+            serializer.set_session_start_handler(_on_device_session_start)
+            serializer.set_mic_flush_handler(_on_device_mic_flush)
+            serializer.set_wake_handler(_on_device_wake)
 
             # Speaker context v1 (fork): per-wake voice-type verdict → injected
             # as a system conversation item. Out-of-band w.r.t. the audio path;
@@ -747,7 +770,7 @@ class WebSocketHandler:
             # not have it yet — follow-ups and later turns do. Gating of
             # speaker-restricted tools does NOT depend on this injection (see
             # SafeRealtimeLLMService.register_function in main.py).
-            if self.speaker_probe is not None and self.speaker_probe.enabled:
+            if connection.speaker_probe is not None and connection.speaker_probe.enabled:
                 from .speaker_context import verdict_text
 
                 async def _on_speaker_verdict(label, name, f0):
@@ -759,7 +782,7 @@ class WebSocketHandler:
                                     role="system",
                                     content=[openai_rt_events.ItemContent(
                                         type="input_text",
-                                        text=verdict_text(self.speaker_probe, label, name, f0),
+                                        text=verdict_text(connection.speaker_probe, label, name, f0),
                                     )],
                                 )
                             )
@@ -767,11 +790,11 @@ class WebSocketHandler:
                     except Exception as e:
                         logger.warning(f"⚠️ speaker verdict injection failed: {e!r}")
 
-                self.speaker_probe.on_verdict = _on_speaker_verdict
-                self._serializer.set_speaker_probe(self.speaker_probe)
+                connection.speaker_probe.on_verdict = _on_speaker_verdict
+                serializer.set_speaker_probe(connection.speaker_probe)
 
             if self.enrollment_recorder is not None:
-                self._serializer.set_enrollment_recorder(self.enrollment_recorder)
+                serializer.set_enrollment_recorder(self.enrollment_recorder)
             # Button-cancel shortly after a wake = user flagging a false
             # trigger: label the latest probe capture like mark_false_wake.
             async def _on_button_cancel():
@@ -789,209 +812,334 @@ class WebSocketHandler:
                         await PUBLISHER.false_wake()
                 except Exception as e:
                     logger.warning(f"⚠️ button false-wake flag failed: {e!r}")
-            self._serializer.set_button_cancel_handler(_on_button_cancel)
+            serializer.set_button_cancel_handler(_on_button_cancel)
 
             async def _on_first_audio():
-                await self.broadcast_json({"type": "ack"})
-            self._serializer.set_first_audio_handler(_on_first_audio)
+                await connection.send_json({"type": "ack"})
+            serializer.set_first_audio_handler(_on_first_audio)
 
             if self.enrollment_conductor is not None:
                 async def _on_device_enroll_stopped():
-                    await self.enrollment_conductor.stop()
-                self._serializer.set_enroll_stopped_handler(_on_device_enroll_stopped)
+                    if self.enrollment_conductor.device_id == connection.device_id:
+                        await self.enrollment_conductor.stop()
+                serializer.set_enroll_stopped_handler(_on_device_enroll_stopped)
 
         return pipeline, runner, task
+
+    async def _wedge_check(
+        self, connection: DeviceConnection, phase_emitter: PhaseEmitter, wake_mono: float
+    ) -> None:
+        """Reconnect a quiet wake only while its connection is still live."""
+        await asyncio.sleep(self.WEDGE_TIMEOUT_S)
+        if getattr(phase_emitter, "last_vad_mono", 0.0) >= wake_mono:
+            return
+        recovery = connection.recovery
+        if recovery is None:
+            return
+        logger.warning(
+            "🧟 no server VAD activity %.0fs after wake — presuming a "
+            "half-open OpenAI socket, reconnecting", self.WEDGE_TIMEOUT_S
+        )
+        await recovery.force_reconnect("wedge: silent after wake")
     
-    def extract_client_id(self, websocket) -> str:
-        """
-        Extract client ID from websocket connection.
-        
+    # ------------------------------------------------------------------
+    # Device addressing
+    #
+    # Announce, timers and enrollment all speak "to the device". With more
+    # than one connected that question has to be answered explicitly, so
+    # these take an optional device id and fall back to the most recently
+    # active device.
+    # ------------------------------------------------------------------
+
+    def resolve_device(self, device_id: Optional[str] = None) -> Optional[DeviceConnection]:
+        """Pick the device a single-device feature should act on.
+
         Args:
-            websocket: WebSocket connection object
-            
+            device_id: An explicit target, or None for the most recently
+                active device.
+
         Returns:
-            Client ID string
+            The connection, or None if there is no match.
         """
-        client_ip = None
-        if hasattr(websocket, 'client') and websocket.client:
-            client_ip = websocket.client.host
-        elif hasattr(websocket, 'remote_address'):
-            client_ip = str(websocket.remote_address[0]) if websocket.remote_address else None
-        
-        if not client_ip:
-            client_ip = f"unknown_{uuid.uuid4().hex[:8]}"
-            logger.warning("⚠️ Could not extract client IP, using generated ID")
+        return self.devices.resolve(device_id)
 
-        return client_ip
+    async def send_json_to(self, obj: dict, device_id: Optional[str] = None) -> bool:
+        """Send one JSON control frame to a single device.
 
-    async def _send_json(self, websocket, obj: dict) -> None:
-        """Send a JSON object to one device as a TEXT websocket frame.
+        Args:
+            obj: The object to serialize.
+            device_id: Target device, or None for the most recently active.
 
-        IMPORTANT: use COMPACT separators (no space after ':' or ','). The Voice
-        PE va_client does a literal substring match on `"value":"<phase>"`
-        (va_client.cpp handle_text_), so the default json.dumps output
-        `"value": "listening"` (with a space) would NOT match and the device
-        would silently ignore every phase. Compact output `"value":"listening"`
-        matches. This is what made listening/thinking/replying never reach the
-        device (LED stuck idle, no-speech watchdog never cancelled).
+        Returns:
+            True if a device took it.
         """
-        try:
-            await websocket.send(json.dumps(obj, separators=(",", ":")))
-        except Exception as e:
-            logger.warning(f"⚠️ Could not send {obj.get('type')} to device: {e!r}")
+        connection = self.resolve_device(device_id)
+        if connection is None:
+            logger.warning(f"⚠️ no device to send {obj.get('type')} to (target={device_id or 'last-active'})")
+            return False
+        return await connection.send_json(obj)
 
-    async def broadcast_json(self, obj: dict) -> None:
-        """Send a JSON object to every connected device as a TEXT frame."""
-        for ws in list(self._websockets):
-            await self._send_json(ws, obj)
-
-    async def broadcast_bytes(self, data: bytes) -> None:
-        """Send raw binary (24 kHz mono PCM16 audio) to every connected device.
+    async def send_bytes_to(self, data: bytes, device_id: Optional[str] = None) -> bool:
+        """Send raw 24 kHz mono PCM16 to a single device.
 
         The device treats every BINARY frame as reply audio, so this pushes
-        sound to the speaker outside any OpenAI response — used by the
-        enrollment conductor's guidance prompts."""
-        for ws in list(self._websockets):
-            try:
-                await ws.send(data)
-            except Exception as e:
-                logger.warning(f"⚠️ broadcast_bytes failed: {e!r}")
+        sound to one speaker outside any OpenAI response — used by the
+        enrollment conductor's guidance prompts and by announcements.
 
-    async def broadcast_phase(self, value: str) -> None:
-        """Send a va_client phase message to every connected device."""
-        # TEMP instrumentation: log the broadcast + how many device sockets we
-        # think are connected (was debug).
-        logger.info(f"➡️ broadcast phase '{value}' to {len(self._websockets)} device(s)")
-        await self.broadcast_json({"type": "phase", "value": value})
-    
-    def setup_event_handlers(
-        self,
-        transport: WebsocketServerTransport,
-        on_client_connected_callback: Callable[[str], Awaitable[None]],
-        on_client_disconnected_callback: Optional[Callable[[str], None]] = None,
-        openai_service_getter: Optional[Callable[[str], Optional[OpenAIRealtimeLLMService]]] = None
-    ):
-        """
-        Setup WebSocket event handlers.
-        
         Args:
-            transport: The WebSocket transport instance
-            on_client_connected_callback: Async callback function(client_id) called when client connects
-            on_client_disconnected_callback: Optional callback function(client_id) called when client disconnects
-            openai_service_getter: Optional function(client_id) -> OpenAIRealtimeLLMService to get service for interrupt
+            data: PCM16 audio.
+            device_id: Target device, or None for the most recently active.
+
+        Returns:
+            True if a device took it.
         """
-        @transport.event_handler("on_client_connected")
-        async def on_client_connected(transport: WebsocketServerTransport, websocket):
-            """Handle new WebSocket client connection."""
-            client_id = self.extract_client_id(websocket)
-            logger.info(f"🔗 New WebSocket connection from IP: {client_id}")
-            # Track the raw connection so we can push phase/control TEXT frames.
-            self._websockets.add(websocket)
-            # Handshake ack expected by the va_client protocol (server -> device
-            # "hello"). The Voice PE firmware tolerates its absence, but sending
-            # it keeps both sides in lockstep with the documented protocol.
-            # follow_up_ms tells the device how long to keep the mic open after a
-            # reply (post-reply follow-up window); 0/absent = turn-based. Sent on
-            # every connect so an add-on config change takes effect on reconnect.
-            await self._send_json(
-                websocket,
-                {
-                    "type": "hello",
-                    "audio_out": "pcm",
-                    "follow_up_ms": self.follow_up_ms,
-                    "follow_up_open_delay_ms": self.follow_up_open_delay_ms,
-                    "wake_open_delay_ms": self.wake_open_delay_ms,
-                    "playback_prebuffer_ms": self.playback_prebuffer_ms,
-                },
-            )
-            await on_client_connected_callback(client_id)
+        connection = self.resolve_device(device_id)
+        if connection is None:
+            logger.warning("⚠️ no device to send audio to")
+            return False
+        transport = connection.transport
+        client = getattr(transport, "client", None) if transport else None
+        if client is None:
+            return False
+        try:
+            await client.send(data)
+            return True
+        except Exception as e:
+            logger.warning(f"⚠️ send_bytes_to {connection.device_id} failed: {e!r}")
+            return False
 
-        @transport.event_handler("on_client_disconnected")
-        async def on_client_disconnected(transport: WebsocketServerTransport, websocket, *args, **kwargs):
-            """Handle client disconnection."""
-            self._websockets.discard(websocket)
-            client_id = self.extract_client_id(websocket)
-            if client_id:
-                logger.info(f"🔌 Client {client_id} disconnected")
-                if on_client_disconnected_callback:
-                    on_client_disconnected_callback(client_id)
-        
-        # Handle text messages from client (e.g., interrupt messages)
-        @transport.event_handler("on_client_message")
-        async def on_client_message(transport: WebsocketServerTransport, websocket, message):
-            """Handle text messages from WebSocket client."""
-            try:
-                client_id = self.extract_client_id(websocket)
-                
-                # Try to parse as JSON
-                if isinstance(message, bytes):
-                    message = message.decode('utf-8')
-                
+    async def broadcast_json(self, obj: dict) -> int:
+        """Send a JSON object to every connected device.
+
+        Args:
+            obj: The object to serialize.
+
+        Returns:
+            How many devices took it.
+        """
+        return await self.devices.broadcast_json(obj)
+
+    def serializer_for(self, device_id: Optional[str] = None) -> Optional[RawAudioSerializer]:
+        """The serializer of one device, for inbound-audio suppression.
+
+        Args:
+            device_id: Target device, or None for the most recently active.
+
+        Returns:
+            That device's serializer, or None.
+        """
+        connection = self.resolve_device(device_id)
+        return connection.serializer if connection else None
+
+    # ------------------------------------------------------------------
+    # Audio recording ownership
+    #
+    # AudioRecordingService writes a single session file, so only one
+    # connection may feed it or the recordings interleave into nonsense.
+    # ------------------------------------------------------------------
+
+    def _claim_recording(self, device_id: str) -> bool:
+        """Try to become the device whose audio is recorded.
+
+        Args:
+            device_id: The connecting device.
+
+        Returns:
+            True if this device now owns recording.
+        """
+        if not self.audio_recording_service:
+            return False
+        if self._recording_owner in (None, device_id):
+            newly_claimed = self._recording_owner is None
+            self._recording_owner = device_id
+            if newly_claimed:
+                self.audio_recording_service.start_new_session(device_id)
+            return True
+        logger.info(
+            f"🎙️ audio recording is already following {self._recording_owner}; "
+            f"not recording {device_id}"
+        )
+        return False
+
+    def _release_recording(self, device_id: str) -> None:
+        """Give up recording ownership when that device disconnects.
+
+        Args:
+            device_id: The departing device.
+        """
+        if self._recording_owner == device_id:
+            self.audio_recording_service.stop_recording()
+            self._recording_owner = None
+
+    # ------------------------------------------------------------------
+    # Connection lifecycle
+    # ------------------------------------------------------------------
+
+    def hello_payload(self) -> dict:
+        """The handshake the device expects immediately after connecting.
+
+        follow_up_ms tells the device how long to hold the mic open after a
+        reply; the delays cover the speaker's hardware tail so it cannot leak
+        back into a freshly opened mic. Sent on every connect so an add-on
+        config change takes effect on reconnect.
+
+        Returns:
+            The `hello` object.
+        """
+        return {
+            "type": "hello",
+            "audio_out": "pcm",
+            "follow_up_ms": self.follow_up_ms,
+            "follow_up_open_delay_ms": self.follow_up_open_delay_ms,
+            "wake_open_delay_ms": self.wake_open_delay_ms,
+            "playback_prebuffer_ms": self.playback_prebuffer_ms,
+        }
+
+    async def serve_connection(
+        self,
+        websocket,
+        on_client_connected: Optional[Callable[[str], Awaitable[None]]] = None,
+        on_client_disconnected: Optional[Callable[[DeviceConnection], None]] = None,
+        activity_callback: Optional[Callable[[], None]] = None,
+    ) -> None:
+        """Own one device connection from accept to close.
+
+        Builds this device its own serializer, transport, OpenAI session and
+        pipeline, then runs that pipeline until the socket closes. Several of
+        these run concurrently — one per device — which is the whole point:
+        the old single transport closed the incumbent socket on every new
+        connection, so two devices could only take turns.
+
+        Args:
+            websocket: The FastAPI/starlette WebSocket, not yet accepted.
+            on_client_connected: Optional async callback(device_id).
+            on_client_disconnected: Optional callback(connection).
+            activity_callback: Optional session-activity callback.
+        """
+        await websocket.accept()
+        device_id = device_id_from_websocket(websocket)
+        logger.info(f"🔗 device {device_id} connected ({len(self.devices) + 1} total)")
+
+        serializer = RawAudioSerializer(device_id)
+        connection = DeviceConnection(
+            device_id=device_id, websocket=websocket, serializer=serializer
+        )
+        connection.transport = self.create_transport(websocket, serializer)
+
+        # Keepalive. The device sends {"type":"ping"} and waits for a pong;
+        # the previous implementation registered this on an event pipecat
+        # never fires, so no pong was ever sent.
+        async def _on_ping():
+            await connection.send_json({"type": "pong"})
+
+        serializer.set_ping_handler(_on_ping)
+
+        # Any wake marks this device as the one in use, so announcements and
+        # timers land in the room the user is actually talking to.
+        serializer.set_activity_handler(connection.touch)
+
+        displaced = None
+        registered = False
+        try:
+            if self.openai_service_factory is None:
+                raise RuntimeError("openai_service_factory must be set before serving connections")
+            connection.openai_service = await self.openai_service_factory(connection)
+
+            pipeline, runner, task = self.build_pipeline(connection, activity_callback)
+            connection.pipeline = pipeline
+            connection.runner = runner
+            connection.task = task
+
+            @connection.transport.event_handler("on_client_disconnected")
+            async def _stop_disconnected_task(_transport, _websocket):
+                # Pipecat's FastAPI input transport signals this event but does
+                # not stop PipelineRunner itself. Cancel only this device's task
+                # so serve_connection reaches its per-device cleanup.
+                #
+                # Pipecat invokes handlers as handler(emitter, *event_args), so
+                # this takes the transport as well as the websocket. Getting the
+                # arity wrong raises before the cancel, leaving the old pipeline
+                # running: its recorder then pushes into torn-down processors
+                # ("no attribute _FrameProcessor__input_queue") until
+                # push_error_frame recurses past the stack limit.
+                await task.cancel()
+
+            displaced = await self.devices.add(connection)
+            registered = True
+            await connection.send_json(self.hello_payload())
+
+            if displaced is not None:
+                await self._teardown(displaced)
+                displaced = None
+
+            if on_client_connected:
+                await on_client_connected(device_id)
+
+            # Blocks until the device disconnects (or the pipeline ends).
+            await runner.run(task)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error(f"❌ connection for {device_id} failed: {e!r}", exc_info=True)
+        finally:
+            removed = await self.devices.remove(connection)
+            if not removed and connection.openai_service is not None and self.session_manager:
+                self.session_manager.handle_client_disconnect(
+                    connection.device_id, connection.openai_service
+                )
+            if removed:
+                self._release_recording(device_id)
+                if (
+                    self.enrollment_conductor is not None
+                    and self.enrollment_conductor.device_id == device_id
+                ):
+                    await self.enrollment_conductor.stop()
+            elif not registered and connection.records_audio:
+                self._release_recording(device_id)
+            if removed and on_client_disconnected:
                 try:
-                    data = json.loads(message)
-                    message_type = data.get("type")
-                    
-                    if message_type == "interrupt":
-                        logger.info(f"🛑 Interrupt received from client {client_id}")
-                        
-                        # Get OpenAI service for this client
-                        openai_service = None
-                        if openai_service_getter:
-                            openai_service = openai_service_getter(client_id)
-                        
-                        if openai_service:
-                            # Send interrupt event to OpenAI Realtime API
-                            # The interrupt event tells OpenAI to stop speaking and listen for user input
-                            try:
-                                # Try to send interrupt event directly to the service
-                                # OpenAI Realtime API expects: {"type": "response.interrupt"}
-                                if hasattr(openai_service, 'send_interrupt'):
-                                    await openai_service.send_interrupt()
-                                    logger.info(f"✅ Interrupt sent to OpenAI service for client {client_id}")
-                                elif hasattr(openai_service, 'push_event'):
-                                    # Send interrupt event via push_event
-                                    await openai_service.push_event({"type": "response.interrupt"})
-                                    logger.info(f"✅ Interrupt event sent to OpenAI service for client {client_id}")
-                                elif hasattr(openai_service, '_send_event'):
-                                    # Try private method if available
-                                    await openai_service._send_event({"type": "response.interrupt"})
-                                    logger.info(f"✅ Interrupt sent via _send_event to OpenAI service for client {client_id}")
-                                else:
-                                    # Fallback: log warning
-                                    logger.warning(f"⚠️ Could not find method to send interrupt to OpenAI service. Available methods: {[m for m in dir(openai_service) if not m.startswith('__')]}")
-                            except Exception as e:
-                                logger.error(f"❌ Error sending interrupt to OpenAI service: {e}", exc_info=True)
-                        else:
-                            logger.warning(f"⚠️ No OpenAI service found for client {client_id}, cannot send interrupt")
-                    elif message_type == "start":
-                        # va_client sends {"type":"start"} on connect. The
-                        # pipeline already streams continuously with server VAD,
-                        # so there's nothing to start here — just acknowledge.
-                        logger.debug(f"▶️ start from client {client_id}")
-                    elif message_type == "ping":
-                        # Keepalive. Reply with pong on the same connection.
-                        await self._send_json(websocket, {"type": "pong"})
-                    else:
-                        logger.debug(f"📨 Received message from client {client_id}: {message_type}")
-                        
-                except json.JSONDecodeError:
-                    logger.debug(f"📨 Received non-JSON message from client {client_id}: {message[:100]}")
-                    
-            except Exception as e:
-                logger.error(f"❌ Error handling client message: {e}", exc_info=True)
-    
-    async def cleanup(self):
-        """Cleanup WebSocket handler resources."""
-        if self.runner:
-            try:
-                await self.runner.cancel()
-            except Exception as e:
-                logger.warning(f"⚠️ Error cancelling runner: {e}")
-        
-        if self.transport:
-            try:
-                if hasattr(self.transport, 'stop'):
-                    await self.transport.stop()
-            except Exception as e:
-                logger.warning(f"⚠️ Error stopping transport: {e}")
+                    on_client_disconnected(connection)
+                except Exception as e:
+                    logger.warning(f"⚠️ disconnect callback for {device_id} failed: {e!r}")
+            await self._teardown(connection)
+            logger.info(f"🔌 device {device_id} disconnected ({len(self.devices)} remaining)")
 
+    async def _teardown(self, connection: DeviceConnection) -> None:
+        """Release one connection's pipeline and OpenAI session.
+
+        Args:
+            connection: The connection to tear down.
+        """
+        if connection.task is not None:
+            try:
+                await connection.task.cancel()
+            except Exception as e:
+                logger.debug(f"task cancel for {connection.device_id}: {e!r}")
+        recovery = connection.recovery
+        if recovery is not None:
+            await recovery.close()
+        phase_emitter = connection.phase_emitter
+        if phase_emitter is not None:
+            await phase_emitter.close()
+        service = connection.openai_service
+        if service is not None:
+            for method in ("disconnect", "_disconnect", "cleanup"):
+                closer = getattr(service, method, None)
+                if closer is None:
+                    continue
+                try:
+                    await closer()
+                    break
+                except Exception as e:
+                    logger.debug(f"{method}() for {connection.device_id}: {e!r}")
+        connection.task = None
+        connection.runner = None
+        connection.pipeline = None
+        connection.openai_service = None
+        connection.recovery = None
+        connection.phase_emitter = None
+
+    async def cleanup(self):
+        """Tear down every connection at shutdown."""
+        for connection in self.devices:
+            await self._teardown(connection)

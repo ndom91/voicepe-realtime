@@ -2,11 +2,23 @@
 
 All notable changes to this add-on. Newest first.
 
-## 0.16.8 (fork)
+## 0.16.9 (fork)
 
 - Added selectable OpenAI transcription models, including `gpt-live-transcribe`
   and `gpt-transcribe`. Both now receive their required `languages` array when
   a transcription language is configured.
+
+## 0.16.8 (fork)
+
+- **Multiple Voice PE devices on one add-on instance**: every connected device
+  now has its own OpenAI session, conversation history, audio pipeline, phase
+  updates, speaker-recognition state, and enrollment flow. Devices can talk at
+  the same time without interrupting or receiving audio from one another.
+- Reconnecting a device replaces only its own stale connection; other active
+  devices keep their conversations intact.
+- Timer announcements and acknowledgements stay with the device that created
+  the timer. Targeted announce requests now return an error when that device
+  is offline rather than reporting a false success.
 
 ## 0.16.7 (fork)
 
