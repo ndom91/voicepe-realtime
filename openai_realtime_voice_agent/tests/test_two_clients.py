@@ -17,10 +17,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import uvicorn
 import websockets
-from fastapi import FastAPI, WebSocket
+import uvicorn
 
+from app.main import Application
 from app.websocket_handler import WebSocketHandler
 
 PORT = 18770
@@ -75,11 +75,10 @@ async def build_server():
 
     handler.build_pipeline = fake_build
 
-    web_app = FastAPI()
-
-    @web_app.websocket("/")
-    async def endpoint(websocket: WebSocket):
-        await handler.serve_connection(websocket)
+    app = Application()
+    app.websocket_handler = handler
+    app.session_manager = None
+    web_app = app.build_web_app()
 
     config = uvicorn.Config(web_app, host="127.0.0.1", port=PORT, log_level="error", lifespan="off")
     server = uvicorn.Server(config)
@@ -158,6 +157,15 @@ async def main():
             await legacy.send(json.dumps({"type": "ping"}))
             assert json.loads(await asyncio.wait_for(legacy.recv(), 5)) == {"type": "pong"}
             print("legacy   -> ping/pong works without a device_id")
+        await asyncio.sleep(0.5)
+
+        async with websockets.connect(
+            f"ws://127.0.0.1:{PORT}/voice/pe?device_id=hall"
+        ) as non_root:
+            assert json.loads(await asyncio.wait_for(non_root.recv(), 5))["type"] == "hello"
+            await asyncio.sleep(0.3)
+            assert handler.devices.ids() == ["hall"], handler.devices.ids()
+            print("routing  -> non-root websocket paths stay accepted")
         await asyncio.sleep(0.5)
 
         await asyncio.sleep(0.5)
