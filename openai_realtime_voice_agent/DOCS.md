@@ -124,8 +124,10 @@ acknowledged), then a gentle bell only if unacknowledged — silenced by the cen
 button or "stop".
 
 Setup: set **`timer_ring_entity`** to your device's exposed
-`switch.<device>_timer_ringing` entity. Without it, the assistant will say timers
-are unavailable. Timers survive the hourly session refresh but not add-on restarts.
+`switch.<device>_timer_ringing` entity. For a shared multi-device add-on, use
+**`timer_ring_entities`** with `device_id=entity_id` entries separated by commas.
+Without either setting, the assistant will say timers are unavailable. Timers survive
+the hourly session refresh but not add-on restarts.
 
 ## 7. Speaker awareness & voice enrollment
 

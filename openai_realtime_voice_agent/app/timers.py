@@ -31,8 +31,17 @@ RING_AUTO_OFF_S = 120  # stop ringing after 2 min if nobody silences it
 ANNOUNCE_GRACE_S = 20  # spoken announcement first; ring only if unacknowledged
 
 
-async def _set_ring(on: bool) -> bool:
-    entity = os.environ.get("TIMER_RING_ENTITY", "").strip()
+def _ring_entity(device_id: str, allow_legacy: bool = True) -> str:
+    mappings = os.environ.get("TIMER_RING_ENTITIES", "")
+    for mapping in mappings.split(","):
+        key, separator, entity = mapping.partition("=")
+        if separator and key.strip() == device_id:
+            return entity.strip()
+    return os.environ.get("TIMER_RING_ENTITY", "").strip() if allow_legacy else ""
+
+
+async def _set_ring(on: bool, device_id: str = "", allow_legacy: bool = True) -> bool:
+    entity = _ring_entity(device_id, allow_legacy)
     token = os.environ.get("SUPERVISOR_TOKEN", "")
     if not entity or not token:
         return False
@@ -54,12 +63,12 @@ class TimerRegistry:
     def __init__(self):
         self._timers: Dict[int, dict] = {}
         self._next_id = 1
-        # Wired by main.py: announcer(text) speaks via the device's TTS lane;
-        # get_owner() returns the current speaker's name; last_wake() returns a
-        # monotonic timestamp of the most recent device wake (ack detection).
+        # Wired by main.py. Every callback accepts the timer's device ID so an
+        # expiry stays in the room where it was created.
         self.announcer = None
         self.get_owner = None
         self.last_wake = None
+        self.allow_legacy_ring = None
 
     def _prune(self):
         now = time.monotonic()
@@ -77,7 +86,7 @@ class TimerRegistry:
             if not t.get("owner") and self.get_owner is not None and wait > 8:
                 await asyncio.sleep(6)
                 try:
-                    t["owner"] = (self.get_owner() or "").strip().lower()
+                    t["owner"] = (self.get_owner(t["device_id"]) or "").strip().lower()
                 except Exception:
                     pass
                 wait = t["ends"] - time.monotonic()
@@ -94,34 +103,40 @@ class TimerRegistry:
         if self.announcer is not None:
             try:
                 who = f"{owner.capitalize()}, y" if owner else "Y"
-                await self.announcer(f"{who}our {nice}timer is done.")
-                announced = True
+                announced = await self.announcer(
+                    f"{who}our {nice}timer is done.", t["device_id"]
+                )
             except Exception as e:
                 logger.warning(f"⚠️ timer announcement failed: {e!r}")
-        # 2. Grace: any wake = acknowledged, no bell.
+        # 2. Grace: a wake from the originating device acknowledges it.
         if announced:
             t0 = time.monotonic()
             await asyncio.sleep(ANNOUNCE_GRACE_S)
-            if self.last_wake is not None and self.last_wake() > t0:
+            if self.last_wake is not None and self.last_wake(t["device_id"]) > t0:
                 logger.info(f"⏰ timer {tid} acknowledged by wake — no ring")
                 self._timers.pop(tid, None)
                 return
         # 3. The gentle bell (auto-off backstop unchanged).
         logger.info(f"⏰ timer {tid} escalating to ring")
-        if await _set_ring(True):
+        allow_legacy = (
+            self.allow_legacy_ring(t["device_id"])
+            if self.allow_legacy_ring is not None else True
+        )
+        if await _set_ring(True, t["device_id"], allow_legacy):
             await asyncio.sleep(RING_AUTO_OFF_S)
-            await _set_ring(False)
+            await _set_ring(False, t["device_id"], allow_legacy)
         self._timers.pop(tid, None)
 
-    def set_timer(self, seconds: int, label: str, owner: str = "") -> dict:
+    def set_timer(self, seconds: int, label: str, owner: str = "", device_id: str = "") -> dict:
         self._prune()
-        if len(self._timers) >= MAX_TIMERS:
+        if sum(t["device_id"] == device_id for t in self._timers.values()) >= MAX_TIMERS:
             return {"error": "too many timers running"}
         seconds = max(5, min(int(seconds), MAX_DURATION_S))
         tid = self._next_id
         self._next_id += 1
         self._timers[tid] = {
             "owner": (owner or "").strip().lower(),
+            "device_id": device_id,
             "label": label or f"timer {tid}",
             "ends": time.monotonic() + seconds,
             "wall": time.time() + seconds,
@@ -136,19 +151,21 @@ class TimerRegistry:
             pass
         return {"id": tid, "label": self._timers[tid]["label"], "seconds": seconds}
 
-    def cancel(self, tid: Optional[int]) -> dict:
+    def cancel(self, tid: Optional[int], device_id: str = "") -> dict:
         self._prune()
+        timers = self.list_timers(device_id)["timers"]
         if tid is None:
-            if len(self._timers) == 1:
-                tid = next(iter(self._timers))
-            elif not self._timers:
+            if len(timers) == 1:
+                tid = timers[0]["id"]
+            elif not timers:
                 return {"error": "no timers running"}
             else:
                 return {"error": "multiple timers running — need the id",
-                        "timers": self.list_timers()["timers"]}
-        t = self._timers.pop(int(tid), None)
-        if not t:
+                        "timers": timers}
+        t = self._timers.get(int(tid))
+        if not t or t["device_id"] != device_id:
             return {"error": f"no timer {tid}"}
+        del self._timers[int(tid)]
         t["task"].cancel()
         logger.info(f"⏰ timer {tid} cancelled")
         try:
@@ -159,12 +176,13 @@ class TimerRegistry:
             pass
         return {"cancelled": tid, "label": t["label"]}
 
-    def list_timers(self) -> dict:
+    def list_timers(self, device_id: Optional[str] = None) -> dict:
         self._prune()
         now = time.monotonic()
         return {"timers": [
             {"id": tid, "label": t["label"], "seconds_left": int(t["ends"] - now)}
             for tid, t in sorted(self._timers.items())
+            if device_id is None or t["device_id"] == device_id
         ]}
 
 
@@ -188,23 +206,25 @@ def get_timer_tool_definitions() -> list:
     ]
 
 
-def register_timer_tools(llm, registry: "TimerRegistry") -> None:
+def register_timer_tools(llm, registry: "TimerRegistry", device_id: str) -> None:
     async def _set(params: "FunctionCallParams") -> None:
         a = params.arguments or {}
         owner = ""
         if registry.get_owner is not None:
             try:
-                owner = registry.get_owner() or ""
+                owner = registry.get_owner(device_id) or ""
             except Exception:
                 pass
-        await params.result_callback(registry.set_timer(a.get("seconds", 0), (a.get("label") or "").strip(), owner))
+        await params.result_callback(registry.set_timer(
+            a.get("seconds", 0), (a.get("label") or "").strip(), owner, device_id
+        ))
 
     async def _cancel(params: "FunctionCallParams") -> None:
         a = params.arguments or {}
-        await params.result_callback(registry.cancel(a.get("id")))
+        await params.result_callback(registry.cancel(a.get("id"), device_id))
 
     async def _list(params: "FunctionCallParams") -> None:
-        await params.result_callback(registry.list_timers())
+        await params.result_callback(registry.list_timers(device_id))
 
     llm.register_function("set_timer", _set)
     llm.register_function("cancel_timer", _cancel)

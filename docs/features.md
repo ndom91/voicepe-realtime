@@ -224,14 +224,16 @@ Expiry is polite, in three stages:
 1. **One personal spoken announcement** — *"Alex, your pasta timer is done"* —
    addressed to whoever set it (via [speaker recognition](#speaker-recognition--voice-enrollment)).
    No nagging repeats.
-2. **A 20-second grace period.** Any wake of the device counts as
+2. **A 20-second grace period.** A wake from the device that set the timer counts as
    acknowledgement — no bell.
 3. **A gentle two-tone bell** only if unacknowledged, auto-stopping after
    2 minutes. Silence it anytime with the **center button** or **"stop"**.
 
 Setup: expose the device's `switch.<device>_timer_ringing` entity and set it as
 `timer_ring_entity` in the add-on. Without it, the assistant will say timers are
-unavailable rather than pretending.
+unavailable rather than pretending. One add-on instance has one bell entity;
+with multiple devices, the spoken expiry and acknowledgement return to the
+device that set the timer, while the physical bell uses that shared entity.
 
 Timers survive the hourly OpenAI session refresh (they live in the add-on, not
 the model) but **not add-on restarts** — fine for kitchen timers, worth knowing.

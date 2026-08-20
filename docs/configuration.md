@@ -65,7 +65,7 @@ Two places hold configuration:
 | `speaker_female_name` | *(empty)* | Name to use when a female voice is detected. |
 | `male_only_tools` | *(empty)* | Comma-separated tool names that only execute for the male voice. Enforced below the model — it can't be talked around. Convenience gating, not biometric security. |
 | `wake_sound_entity` | *(empty)* | The device's wake-chime switch entity. When set, the chime is auto-muted during enrollment sessions so the coach's instructions stay audible. |
-| `timer_ring_entity` | *(empty)* | The device's exposed `switch.<device>_timer_ringing` entity. Empty = voice timers unavailable (the assistant will say so). |
+| `timer_ring_entity` | *(empty)* | The exposed `switch.<device>_timer_ringing` entity for the physical timer bell. Empty = voice timers unavailable (the assistant will say so). One add-on instance has one bell entity; timer speech still returns to the device that created the timer. |
 | `instance_name` | *(empty)* | Sensor prefix, e.g. `kitchen` → `sensor.voicepe_kitchen_*`. Also sent to your agent as the `room` for report-backs. Empty = `device`. |
 | `enrollment_phrase` | `hey jarvis` | The wake phrase the enrollment coach asks you to repeat. **Set this to the wake word you actually use / plan to train.** |
 | `enrollment_tts_voice` | `fable` | The voice of the enrollment coach (any OpenAI `/v1/audio/speech` voice). |
@@ -80,7 +80,11 @@ Two places hold configuration:
 
 | Option | Default | Purpose / when to change |
 |---|---|---|
-| `websocket_port` | `8080` | The port the Voice PE connects to. Must match the `va_url` in the device firmware. Change only on a port clash (and for second devices — see [multi-device](getting-started.md#part-6--multiple-devices)); `8081` is used by dev builds. |
+| `websocket_port` | `8080` | The port Voice PE devices connect to. Must match each device's `va_url` in its firmware. One add-on instance accepts multiple devices on this port; change it only on a port clash. `8081` is used by dev builds. |
+
+The add-on is intended for a trusted home LAN. A device's `device_id` routes its
+session and is not an authentication credential; do not expose `websocket_port`
+outside that network.
 | `session_reuse_timeout_seconds` | `300` | If the device reconnects within this window (Wi-Fi blip, add-on restart), the conversation resumes where it left off. `0` = always start fresh. |
 | `max_context_messages` | `12` | How many recent exchanges the session keeps. More = better in-conversation memory, but every answer re-bills the whole history — long chats get expensive and can hit rate limits. `0` = unlimited. |
 | `transcription_model` | `gpt-4o-transcribe` | Writes your speech into the log when `transcription_language` is set. Does **not** affect understanding — the main model hears your audio natively. Also: `gpt-realtime-whisper`, `gpt-4o-mini-transcribe`, `whisper-1`. |

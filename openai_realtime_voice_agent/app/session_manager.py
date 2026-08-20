@@ -255,32 +255,27 @@ class SessionManager:
             )
         return None
     
-    def handle_client_disconnect(self, client_id: str, service: Optional[OpenAIRealtimeLLMService] = None):
+    def handle_client_disconnect(self, client_id: str, service: OpenAIRealtimeLLMService) -> None:
         """Handle client disconnection by caching context.
         
         Args:
             client_id: Unique identifier for the client device
-            service: Optional service instance to cache context from
+            service: The departing connection's service.
         """
+        if self.current_services.get(client_id) is not service:
+            logger.debug(f"Ignoring stale disconnect for client {client_id}")
+            return
+
         logger.info(f"🔌 Client {client_id} disconnected - caching context")
-        
-        # Get service to cache from
-        service_to_cache = None
-        if client_id in self.current_services:
-            service_to_cache = self.current_services[client_id]
-        elif service:
-            service_to_cache = service
-        
-        if service_to_cache:
-            try:
-                self.cache_context_from_service(client_id, service_to_cache)
-                if client_id in self.current_services:
-                    del self.current_services[client_id]
-                logger.info(f"💾 Cached context for disconnected client {client_id}")
-            except Exception as e:
-                logger.warning(f"⚠️ Error caching context for disconnected client {client_id}: {e}")
-        else:
-            logger.debug(f"No service found to cache context for client {client_id}")
+        try:
+            self.cache_context_from_service(client_id, service)
+            logger.info(f"💾 Cached context for disconnected client {client_id}")
+        except Exception as e:
+            logger.exception(f"Error caching context for disconnected client {client_id}: {e}")
+        finally:
+            if self.current_services.get(client_id) is service:
+                del self.current_services[client_id]
+                self.remove_context_aggregator(client_id)
 
 
 class ContextInitializer(FrameProcessor):
@@ -314,4 +309,3 @@ class ContextInitializer(FrameProcessor):
             return
         
         await self.push_frame(frame, direction)
-
